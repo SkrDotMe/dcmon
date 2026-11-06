@@ -306,7 +306,7 @@ static void draw_graph(const hist_t *h, int w, int row, int height, uint64_t sca
 enum { RW_BLANK, RW_RULE, RW_CPU_HDR, RW_CPU_BAR, RW_CPU_GRAPH, RW_CORES, RW_TEMP, RW_MEM_HDR,
        RW_MEM_BAR, RW_MEM_GRAPH, RW_NET_HDR, RW_DL_HDR, RW_DL_GRAPH, RW_UL_HDR, RW_UL_GRAPH,
        RW_NET_TOT, RW_DISK_HDR, RW_DISK, RW_DISK_BAR, RW_DISK_MORE, RW_DISK_NONE, RW_HELP,
-       RW_GPU_HDR, RW_GPU_BAR, RW_GPU_GRAPH, RW_GPU_MEM };
+       RW_GPU_HDR, RW_GPU_BAR, RW_GPU_GRAPH, RW_GPU_MEM, RW_DIO_HDR, RW_DIO_GRAPH, RW_DIO_DEV, RW_KV };
 
 typedef struct {
     uint8_t  kind, sub, h;
@@ -319,24 +319,26 @@ typedef struct {
     int   n;
 } col_t;
 
-enum { S_CPU = 1, S_MEM = 2, S_NET = 4, S_DISK = 8, S_GPU = 16, S_ALL = 31 };
+enum { S_CPU = 1, S_MEM = 2, S_NET = 4, S_DISK = 8, S_GPU = 16, S_DIO = 32, S_ALL = 63 };
 
 typedef struct {
-    int gcpu, gmem, gnet, ggpu, rules, dbars, totals;
+    int gcpu, gmem, gnet, ggpu, gdio, rules, dbars, totals, diodev;
 } plan_t;
 
 static col_t colA, colB;
 static struct {
-    int labw, barw, cell, ncols, lines;
+    int labw, barw, cell, ncols, lines, freq;
 } CG;
 static uint32_t *ord;
 static unsigned  ordcap, nord;
-static uint64_t  dl_scale, ul_scale;
+static uint64_t  dl_scale, ul_scale, dio_scale;
+static int       kv_labw;
 
 static uint64_t *g_hash;
 static int       g_hrows, g_wcols, g_force = 1, g_clear;
 
 #define NET_SCALE_FLOOR (10u * 1024u)
+#define DIO_SCALE_FLOOR (1024u * 1024u) /* idle journal writes stay flat */
 
 static void push(col_t *c, int kind, int sub, int h, int arg)
 {
@@ -363,20 +365,24 @@ static void build_ord(const cpu_t *c)
 
 static void core_geom(const app_t *a, int cw)
 {
-    static const int bars[] = {10, 6, 3, 1};
+    /* bar width, frequency column; tried in order until the grid fits */
+    static const int var[][2] = {{10, 1}, {6, 1}, {10, 0}, {6, 0}, {3, 0}, {1, 0}};
     unsigned n = nord, maxl = n <= 32 ? 4 : n <= 128 ? 8 : 16;
-    int labw = 1;
+    int labw = 1, hz = a->cpu.khz_avg != 0;
     for (unsigned x = a->cpu.span ? a->cpu.span - 1 : 0; x >= 10; x /= 10)
         labw++;
     CG.labw = labw;
-    for (int k = 0; k < 4; k++) {
-        int cell = labw + 1 + bars[k] + 1 + 4;
+    for (size_t k = 0; k < ARRAY_LEN(var); k++) {
+        if (var[k][1] && !hz)
+            continue;
+        int cell = labw + 1 + var[k][0] + 1 + 4 + (var[k][1] ? 5 : 0);
         int nc = (cw + 2) / (cell + 2);
         if (nc < 1)
             nc = 1;
         unsigned lines = (n + (unsigned)nc - 1) / (unsigned)nc;
-        if (lines <= maxl || k == 3) {
-            CG.barw = bars[k];
+        if (lines <= maxl || k == ARRAY_LEN(var) - 1) {
+            CG.barw = var[k][0];
+            CG.freq = var[k][1];
             CG.cell = cell;
             CG.ncols = nc;
             CG.lines = (int)lines;
@@ -438,6 +444,15 @@ static int build(const app_t *a, col_t *c, int mask, int cw, const plan_t *p)
         if (p->totals)
             push(c, RW_NET_TOT, 0, 0, 0);
     }
+    if ((mask & S_DIO) && a->dio.fd >= 0) {
+        SECTION();
+        push(c, RW_DIO_HDR, 0, 0, 0);
+        for (int i = 0; i < p->gdio; i++)
+            push(c, RW_DIO_GRAPH, i, p->gdio, 0);
+        if (p->diodev && a->dio.n > 1) /* one disk: the header says it all */
+            for (unsigned i = 0; i < a->dio.n; i++)
+                push(c, RW_DIO_DEV, 0, 0, (int)i);
+    }
     if (mask & S_DISK) {
         SECTION();
         push(c, RW_DISK_HDR, 0, 0, 0);
@@ -462,7 +477,7 @@ static int build(const app_t *a, col_t *c, int mask, int cw, const plan_t *p)
 /* Fit sections into bh rows: first drop decoration, then grow graphs. */
 static int fit(const app_t *a, col_t *c, int mask, int cw, int bh, plan_t *p)
 {
-    *p = (plan_t){1, 1, 1, 1, 1, a->disk_detail, 1};
+    *p = (plan_t){1, 1, 1, 1, 1, 1, a->disk_detail, 1, 1};
     int ngpu = ((mask & S_GPU) && a->gpu_on) ? (int)a->gpu.n : 0;
     int n = build(a, c, mask, cw, p);
     if (n > bh) {
@@ -475,6 +490,10 @@ static int fit(const app_t *a, col_t *c, int mask, int cw, int bh, plan_t *p)
     }
     if (n > bh) {
         p->totals = 0;
+        n = build(a, c, mask, cw, p);
+    }
+    if (n > bh) {
+        p->diodev = 0;
         n = build(a, c, mask, cw, p);
     }
     if (n < bh) {
@@ -499,6 +518,11 @@ static int fit(const app_t *a, col_t *c, int mask, int cw, int bh, plan_t *p)
             if (ngpu && p->ggpu < 8 && extra >= ngpu) {
                 p->ggpu++;
                 extra -= ngpu;
+                ch = 1;
+            }
+            if ((mask & S_DIO) && a->dio.fd >= 0 && p->gdio < 6 && extra >= 1) {
+                p->gdio++;
+                extra--;
                 ch = 1;
             }
         }
@@ -529,13 +553,18 @@ static int load_color(unsigned pm)
 static void row_cpu_hdr(const app_t *a, int w)
 {
     const cpu_t *c = &a->cpu;
-    char thr[32], load[64], tmp[40], pct[24];
+    char thr[32], load[64], tmp[40], pct[24], fq[32], b[24];
     snprintf(thr, sizeof thr, "  %u thread%s", c->online, c->online == 1 ? "" : "s");
-    seg_t l[2] = {{"CPU", C_CPU_B}, {thr, C_DIM}}, r[3];
+    seg_t l[2] = {{"CPU", C_CPU_B}, {thr, C_DIM}}, r[4];
     int nr = 0;
     if (c->load[0]) {
         snprintf(load, sizeof load, "  load %s", c->load);
         r[nr++] = (seg_t){load, C_DIM};
+    }
+    if (c->khz_avg) {
+        fmt_khz(b, sizeof b, c->khz_avg, 0);
+        snprintf(fq, sizeof fq, "  %s", b);
+        r[nr++] = (seg_t){fq, C_DIM};
     }
     if (a->temps_on) {
         int32_t v;
@@ -566,7 +595,7 @@ static void row_cores(const app_t *a, int line, int w)
         if (i >= nord)
             break;
         const cpu_slot_t *s = &a->cpu.core[ord[i]];
-        char lab[16], pc[8];
+        char lab[16], pc[16];
         lb_pad(x0 + k * (CG.cell + 2));
         snprintf(lab, sizeof lab, "%*u", CG.labw, ord[i]);
         lb_text(lab, C_DIM);
@@ -580,6 +609,16 @@ static void row_cores(const app_t *a, int line, int w)
         lb_sp(1);
         snprintf(pc, sizeof pc, "%3u%%", (s->pm + 5) / 10);
         lb_text(pc, C_TEXT);
+        if (CG.freq) {
+            char f[16];
+            lb_sp(1);
+            if (s->khz)
+                fmt_khz(f, sizeof f, s->khz, 1);
+            else
+                snprintf(f, sizeof f, "--");
+            snprintf(pc, sizeof pc, "%4s", f);
+            lb_text(pc, C_DIM);
+        }
     }
     lb_pad(x0 + w);
 }
@@ -854,6 +893,98 @@ static void row_gpu_mem(const app_t *a, int idx, int w)
     lb_pad(start + w);
 }
 
+static void row_dio_hdr(const app_t *a, int w)
+{
+    const dio_t *d = &a->dio;
+    char sc[48], rr[40], wr[40], b[24], cnt[48] = "";
+    seg_t l[2] = {{"DISK I/O", C_DISK_B}, {cnt, C_DIM}}, r[3];
+    int nr = 0;
+    if (d->n == 1)
+        snprintf(cnt, sizeof cnt, "  %s", d->d[0].name);
+    else if (d->n == 0)
+        snprintf(cnt, sizeof cnt, "  no disks");
+    fmt_bytes(b, sizeof b, dio_scale);
+    snprintf(sc, sizeof sc, "  scale %s/s", b);
+    r[nr++] = (seg_t){sc, C_DIM};
+    if (d->ok) {
+        fmt_bytes(b, sizeof b, d->rd_rate);
+        snprintf(rr, sizeof rr, "  R %s/s", b);
+        fmt_bytes(b, sizeof b, d->wr_rate);
+        snprintf(wr, sizeof wr, "  W %s/s", b);
+    } else {
+        snprintf(rr, sizeof rr, "  R --");
+        snprintf(wr, sizeof wr, "  W --");
+    }
+    r[nr++] = (seg_t){rr, C_BOLD};
+    r[nr++] = (seg_t){wr, C_BOLD};
+    draw_lr(w, l, 2, r, nr, 10);
+}
+
+static void row_dio_dev(const app_t *a, int idx, int w)
+{
+    const dio_dev_t *d = &a->dio.d[idx];
+    char rr[40], wr[40], bz[24], b[24];
+    seg_t l[1] = {{d->name, C_TEXT}}, r[3];
+    int nr = 0;
+    if (d->ok) {
+        snprintf(bz, sizeof bz, "  busy %3u%%", (d->busy_pm + 5) / 10);
+        r[nr++] = (seg_t){bz, d->busy_pm >= 900 ? C_HOT : d->busy_pm >= 600 ? C_WARN : C_DIM};
+        fmt_bytes(b, sizeof b, d->rd_rate);
+        snprintf(rr, sizeof rr, "  R %9s/s", b);
+        fmt_bytes(b, sizeof b, d->wr_rate);
+        snprintf(wr, sizeof wr, "  W %9s/s", b);
+        r[nr++] = (seg_t){rr, C_TEXT};
+        r[nr++] = (seg_t){wr, C_TEXT};
+    } else {
+        r[nr++] = (seg_t){"  --", C_DIM};
+    }
+    draw_lr(w, l, 1, r, nr, 6);
+}
+
+static int kv_color(int c)
+{
+    switch (c) {
+    case KC_GOOD: return C_GOOD;
+    case KC_WARN: return C_WARN;
+    case KC_HOT: return C_HOT;
+    case KC_DIM: return C_DIM;
+    default: return C_TEXT;
+    }
+}
+
+static void row_kv(const app_t *a, int idx, int w)
+{
+    const kv_t *r = &a->kv.r[idx];
+    int start = L.col, labc = a->view == VIEW_BAT ? C_DISK_B : C_CPU_B;
+    switch (r->kind) {
+    case KV_HEAD:
+        lb_text(r->v, r->color == KC_DIM ? C_DIM : C_TITLE);
+        break;
+    case KV_ROW:
+    case KV_BAR: {
+        int lw = kv_labw < w / 2 ? kv_labw : w / 2, save = L.limit;
+        L.limit = start + lw;
+        lb_text(r->k, r->color == KC_DIM ? C_DIM : labc);
+        L.limit = save;
+        lb_pad(start + lw + 2);
+        if (r->kind == KV_BAR) {
+            int bw = (w - lw - 2) / 3;
+            if (bw > 30)
+                bw = 30;
+            if (bw >= 6) {
+                draw_bar(bw, r->pm, r->color == KC_TEXT ? labc : kv_color(r->color));
+                lb_sp(2);
+            }
+        }
+        lb_text(r->v, kv_color(r->color));
+        break;
+    }
+    default:
+        break;
+    }
+    lb_pad(start + w);
+}
+
 static const char *const HELP_KEYS[][2] = {
     {"q", "quit"},
     {"+ / -", "faster / slower refresh"},
@@ -863,8 +994,10 @@ static const char *const HELP_KEYS[][2] = {
     {"c", "per-core CPU view on / off"},
     {"t", "temperature details on / off"},
     {"g", "GPU section on / off"},
+    {"i", "system information view"},
+    {"b", "battery view"},
     {"arrows PgUp PgDn", "scroll when the window is too small"},
-    {"h / Esc", "close this help"},
+    {"h / Esc", "close this help (Esc: back from any view)"},
 };
 #define HELP_NKEYS ((int)(sizeof HELP_KEYS / sizeof HELP_KEYS[0]))
 #define HELP_ROWS  (HELP_NKEYS + 8)
@@ -889,7 +1022,7 @@ static void row_help(const app_t *a, int i, int w)
     switch (i) {
     case 0:
         k = "refresh";
-        snprintf(buf, sizeof buf, "%u ms cpu/ram/net, gpu %u ms, temp %u ms, disk %u ms",
+        snprintf(buf, sizeof buf, "%u ms cpu/ram/net/io, gpu+freq %u ms, temp %u ms, disk %u ms",
                  a->interval_ms, a->interval_ms > 1000 ? a->interval_ms : 1000,
                  a->interval_ms > 2000 ? a->interval_ms : 2000,
                  a->interval_ms > 10000 ? a->interval_ms : 10000);
@@ -984,6 +1117,10 @@ static void draw_row(const app_t *a, const row_t *r, int w)
     }
     case RW_GPU_GRAPH: draw_graph(&a->gpu.d[r->arg].hist, w, r->sub, r->h, 1000, C_GPU); break;
     case RW_GPU_MEM: row_gpu_mem(a, r->arg, w); break;
+    case RW_DIO_HDR: row_dio_hdr(a, w); break;
+    case RW_DIO_GRAPH: draw_graph(&a->dio.hist, w, r->sub, r->h, dio_scale, C_DISK); break;
+    case RW_DIO_DEV: row_dio_dev(a, r->arg, w); break;
+    case RW_KV: row_kv(a, r->arg, w); break;
     default: break;
     }
 }
@@ -998,8 +1135,25 @@ static void fill(int to, int split, const char *sg)
 
 static void draw_top(const app_t *a, int W, int split)
 {
-    char r[32], h[80];
-    snprintf(r, sizeof r, " %u ms ", a->interval_ms);
+    char r[96], h[80], up[32];
+    uint64_t u = uptime_s();
+    if (u >= 86400)
+        snprintf(up, sizeof up, "%llud %lluh", (unsigned long long)(u / 86400),
+                 (unsigned long long)(u / 3600 % 24));
+    else if (u >= 3600)
+        snprintf(up, sizeof up, "%lluh %llum", (unsigned long long)(u / 3600),
+                 (unsigned long long)(u / 60 % 60));
+    else
+        snprintf(up, sizeof up, "%llum", (unsigned long long)(u / 60));
+    static const char *const vname[] = {"", "help", "system info", "battery"};
+    if (a->view != VIEW_MAIN)
+        snprintf(r, sizeof r, " %s ", vname[a->view]);
+    else if (W >= 90 && a->cpu.tasks)
+        snprintf(r, sizeof r, " up %s, %u tasks, %u ms ", up, a->cpu.tasks, a->interval_ms);
+    else if (W >= 70)
+        snprintf(r, sizeof r, " up %s, %u ms ", up, a->interval_ms);
+    else
+        snprintf(r, sizeof r, " %u ms ", a->interval_ms);
     int rw = text_cols(r), end = W - 2 - rw;
     lb_color(C_BORDER);
     lb_glyph(G->tl);
@@ -1025,8 +1179,13 @@ static void draw_top(const app_t *a, int W, int split)
 static void draw_bottom(const app_t *a, int W, int split)
 {
     static const char *const hints[][2] = {{"q", "quit"},  {"+/-", "speed"}, {"h", "help"},
-                                           {"n", "net"},   {"c", "cores"},   {"d", "disks"},
-                                           {"t", "temp"},  {"g", "gpu"}};
+                                           {"i", "info"},  {"b", "battery"}, {"n", "net"},
+                                           {"c", "cores"}, {"d", "disks"},   {"t", "temp"},
+                                           {"g", "gpu"}};
+    static const char *const vhints[][2] = {{"q", "quit"}, {"Esc", "back"}, {"i", "info"},
+                                            {"b", "battery"}, {"h", "help"}};
+    const char *const(*hs)[2] = a->view == VIEW_MAIN ? hints : vhints;
+    size_t nh = a->view == VIEW_MAIN ? ARRAY_LEN(hints) : ARRAY_LEN(vhints);
     char right[48] = "";
     if (a->scroll_max > 0)
         snprintf(right, sizeof right, " %s%s %d/%d ", G->up, G->down, a->scroll, a->scroll_max);
@@ -1036,14 +1195,14 @@ static void draw_bottom(const app_t *a, int W, int split)
     lb_color(C_BORDER);
     lb_glyph(G->bl);
     lb_glyph(G->h);
-    for (size_t k = 0; k < sizeof hints / sizeof hints[0]; k++) {
-        int need = 1 + text_cols(hints[k][0]) + 1 + text_cols(hints[k][1]);
+    for (size_t k = 0; k < nh; k++) {
+        int need = 1 + text_cols(hs[k][0]) + 1 + text_cols(hs[k][1]);
         if (L.col + need + 1 > hint_end)
             break;
         lb_sp(1);
-        lb_text(hints[k][0], C_BOLD);
+        lb_text(hs[k][0], C_BOLD);
         lb_sp(1);
-        lb_text(hints[k][1], C_DIM);
+        lb_text(hs[k][1], C_DIM);
     }
     if (L.col < hint_end)
         lb_sp(1);
@@ -1131,10 +1290,25 @@ void render_frame(app_t *a)
     a->scroll_max = 0;
     if (!small) {
         build_ord(&a->cpu);
-        if (a->help) {
+        if (a->view == VIEW_HELP) {
             colA.n = 0;
             for (int i = 0; i < HELP_ROWS; i++)
                 push(&colA, RW_HELP, 0, 0, i);
+        } else if (a->view == VIEW_INFO || a->view == VIEW_BAT) {
+            if (a->view == VIEW_INFO)
+                view_info(a, &a->kv);
+            else
+                view_battery(a, &a->kv);
+            colA.n = 0;
+            kv_labw = 0;
+            for (unsigned i = 0; i < a->kv.n; i++) {
+                push(&colA, RW_KV, 0, 0, (int)i);
+                int lw = text_cols(a->kv.r[i].k);
+                if (a->kv.r[i].kind != KV_HEAD && lw > kv_labw)
+                    kv_labw = lw;
+            }
+            if (kv_labw > 24)
+                kv_labw = 24;
         } else {
             plan_t p;
             int cwn = W - 4;
@@ -1142,7 +1316,7 @@ void render_frame(app_t *a)
                 cwL = (W - 7) / 2;
                 cwR = W - 7 - cwL;
                 int nA = fit(a, &colA, S_CPU | S_MEM | S_GPU, cwL, bh, &p);
-                int nB = fit(a, &colB, S_NET | S_DISK, cwR, bh, &p);
+                int nB = fit(a, &colB, S_NET | S_DIO | S_DISK, cwR, bh, &p);
                 two = nA <= bh && nB <= bh;
                 cwn = cwR;
             }
@@ -1152,6 +1326,7 @@ void render_frame(app_t *a)
             }
             dl_scale = nice_scale(hist_max(&a->net.hrx, (unsigned)cwn), NET_SCALE_FLOOR);
             ul_scale = nice_scale(hist_max(&a->net.htx, (unsigned)cwn), NET_SCALE_FLOOR);
+            dio_scale = nice_scale(hist_max(&a->dio.hist, (unsigned)cwn), DIO_SCALE_FLOOR);
         }
         if (!two && colA.n > bh)
             a->scroll_max = colA.n - bh;

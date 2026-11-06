@@ -12,6 +12,8 @@ typedef struct {
     uint16_t pm;           /* utilisation in permille (0..1000)  */
     uint8_t  online;       /* present in the last /proc/stat     */
     uint8_t  primed;       /* has a previous sample              */
+    int      ffd;          /* cpufreq fd + 1; 0 untried, -1 none */
+    uint32_t khz;          /* current frequency, 0 = unknown     */
 } cpu_slot_t;
 
 typedef struct {
@@ -23,11 +25,14 @@ typedef struct {
     unsigned    online;    /* online logical CPUs                 */
     unsigned    span;      /* highest online id + 1               */
     char        load[48];  /* "0.52 0.48 0.40"                    */
+    unsigned    tasks, running;   /* scheduling entities, runnable */
+    uint32_t    khz_avg, khz_max; /* over online cores, 0 = none  */
     hist_t      hist;
 } cpu_t;
 
 int  cpu_init(cpu_t *c);
 int  cpu_sample(cpu_t *c, int push);
+void cpu_freq_sample(cpu_t *c); /* scaling_cur_freq of online cores */
 void cpu_free(cpu_t *c);
 
 /* exposed for tests */

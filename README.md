@@ -1,19 +1,22 @@
 # dcmon
 
 A very small, fast terminal system monitor for Linux, written in pure C17.
-It shows CPU usage per core, CPU temperature, RAM, GPU (NVIDIA and AMD),
-network throughput and disk space, with coloured bars and scrolling Unicode
-graphs. It is built to
-run all day over SSH with almost no CPU, memory or bandwidth.
+It shows CPU usage and frequency per core, CPU temperature, RAM, GPU
+(NVIDIA and AMD), network throughput, disk I/O and disk space, with coloured
+bars and scrolling Unicode graphs. Two extra views show a summary of the
+machine (`i`, like fastfetch) and everything the kernel reports about the
+batteries (`b`). `--once` and `--json` print a single snapshot for scripts
+and status bars. It is built to run all day over SSH with almost no CPU,
+memory or bandwidth.
 
 Example layout (illustrative values, shortened):
 
 ```
-┌─ dcmon ─ build-box ──────────────────────────────────────────────── 1000 ms ─┐
-│ CPU  12 threads                         load 0.34 0.11 0.04  47.2°C    8.7% │
+┌─ dcmon ─ build-box ─────────────────────────── up 3d 4h, 412 tasks, 1000 ms ─┐
+│ CPU  12 threads               load 0.34 0.11 0.04  3.42 GHz  47.2°C    8.7% │
 │ ████████▎░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
 │                                                              ▂▃▅▇█▆▄▂▂▂▂▂▂ │
-│  0 ░░░░░░░░░░   0%   1 ██████████ 100%   2 ▏░░░░░░░░░   2%   3 ░░░░░░░░░░   0% │
+│  0 ░░░░░░░░░░   0% 4.2G   1 ██████████ 100% 4.6G   2 ▏░░░░░░░░░   2% 800M │
 │ RAM                         avail 22.2 GiB  661 MiB / 22.9 GiB         2.8% │
 │ ██▋░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
 │ GPU  NVIDIA GeForce RTX 3060 Ti      210 MHz  fan 31%  21 / 176 W  37.0°C  0.0% │
@@ -21,17 +24,19 @@ Example layout (illustrative values, shortened):
 │ NETWORK  eth0  up  10 Gb/s                                   default route │
 │ ↓ DOWNLOAD                                      scale 2.00 MiB/s  1.21 MiB/s │
 │ ↑ UPLOAD                                        scale 10.0 KiB/s  3.40 KiB/s │
+│ DISK I/O  nvme0n1                   scale 64.0 MiB/s  R 12.4 MiB/s  W 1.20 MiB/s │
+│                                                              ▁▁▃▇█▅▂▁ │
 │ DISK USAGE                                                 3 filesystems │
 │ /  ext4                       free 949 GiB  6.44 GiB / 1006 GiB          1% │
 │ ▋░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
-└─ q quit +/- speed h help n net c cores d disks t temp g gpu ─────────────────┘
+└─ q quit +/- speed h help i info b battery n net c cores d disks t temp g gpu ┘
 ```
 
 * **No dependencies:** only libc, `/proc`, `/sys` and system calls. No
   ncurses, no libsensors, and no helper processes (`top`, `df`, `ip`,
   `sensors`, `nvidia-smi`, …). NVIDIA's NVML library is loaded at run time
   only when it is installed. It is not needed to build or run dcmon.
-* **Small:** the stripped release binary is about 66 KiB (x86-64, gcc 15).
+* **Small:** the stripped release binary is about 98 KiB (x86-64, gcc 15).
   Its only shared library is libc. Without the GPU section, peak memory is
   about 3.6 MiB. Loading NVIDIA's NVML raises it to about 27 MiB; see the
   benchmark section.
@@ -64,11 +69,70 @@ dcmon --no-temperatures       # skip sensor discovery
 dcmon --no-gpu                # do not load NVML or scan for GPUs
 dcmon --temp-warn 70 --temp-hot 85
 dcmon --ascii                 # plain ASCII drawing
+dcmon --once                  # one plain-text snapshot, then exit
+dcmon --json                  # one JSON snapshot, then exit
+dcmon --config ~/dcmon.conf   # another configuration file (--no-config: none)
 dcmon --duration 60 --stats   # exit after 60 s and print resource usage
 dcmon --help | --version
 ```
 
-Bad arguments print a clear message and exit with status 2.
+Bad arguments and a bad configuration file print a clear message and exit
+with status 2.
+
+### Configuration file
+
+dcmon reads `$XDG_CONFIG_HOME/dcmon/config`, by default
+`~/.config/dcmon/config`, if it exists. Each line is one option, written as
+its long name without the dashes; `#` starts a comment line:
+
+```ini
+# ~/.config/dcmon/config
+interval = 500
+interface = enp3s0
+mount = /
+mount = "/mnt/my data"
+no-gpu                 # same as "no-gpu = yes"
+temp-hot = 90
+
+# start-up state of the toggles (yes/no, on/off, true/false, 1/0)
+cores = off
+disk-details = on
+temp-details = off
+gpu-section = on
+```
+
+* **Precedence:** an option given on the command line wins over the same
+  option in the file. The mount selection (`mount`, `all-mounts`) and the
+  temperature thresholds (`temp-warn`, `temp-hot`) are taken as a group from
+  one source.
+* **Errors** name the file and the line, for example
+  `dcmon: /home/me/.config/dcmon/config:3: unknown option 'colour'`.
+* `once`, `json`, `duration`, `stats`, `config` and `help` are command-line
+  only. `cores`, `disk-details`, `temp-details` and `gpu-section` are
+  file-only (the keys `c`, `d`, `t` and `g` change them while running).
+* `--config FILE` reads another file, which must exist. `--no-config`
+  ignores the file.
+
+### Snapshots: `--once` and `--json`
+
+Both take two samples one refresh interval apart (default 1 s), print the
+result to standard output and exit. They need no terminal, so they work in
+scripts, cron jobs and status bars such as i3blocks or waybar:
+
+```bash
+dcmon --once
+dcmon --json | jq '.cpu.usage_pct, .memory.usage_pct'
+dcmon --json --interval 250 --no-gpu
+```
+
+`--once` prints aligned plain text with no escape sequences. `--json` prints
+one object on one line. Sizes are bytes, rates are bytes per second,
+percentages have one decimal and temperatures are degrees Celsius. A value
+that is not available is `null`. Top-level keys: `version`, `host`,
+`uptime_s`, `tasks`, `cpu` (usage, load, threads, frequency, temperature,
+per-core list), `memory`, `gpus`, `network`, `disk_io` (total and per disk),
+`filesystems`, `batteries` and `ac_online`. Network filesystems that do not
+answer within the interval are reported with `"error": "pending"`.
 
 ### Keys
 
@@ -83,6 +147,9 @@ Bad arguments print a clear message and exit with status 2.
 | `c` | per-core CPU grid on/off |
 | `t` | temperature details (package, hottest core, sensor driver) |
 | `g` | GPU section on/off. While hidden, the GPU is not queried at all. |
+| `i` | system information view (press again or `Esc` to go back) |
+| `b` | battery view (press again or `Esc` to go back) |
+| `Esc` | back to the monitor from any view |
 | `↑` `↓` `PgUp` `PgDn` `j` `k` | scroll when the window is too small |
 
 Ctrl-Z suspends dcmon and restores the terminal. `fg` resumes it.
@@ -92,13 +159,18 @@ Ctrl-Z suspends dcmon and restores the terminal. `fg` resumes it.
 | Section | Source | Notes |
 |---|---|---|
 | CPU | `/proc/stat` | busy = Δ(user+nice+system+irq+softirq+steal) / Δtotal. idle includes iowait. Guest time is already counted inside user/nice. Handles iowait going backwards, counter resets, and CPU hotplug (a CPU that comes back starts from a fresh baseline). |
-| Load | `/proc/loadavg` | |
+| CPU frequency | `/sys/devices/system/cpu/cpuN/cpufreq/scaling_cur_freq` | Average in the CPU header, per core in the core grid when it fits. Read once a second. Not shown where cpufreq does not exist (WSL2, many VMs). |
+| Load, tasks | `/proc/loadavg` | The 4th field gives runnable and total scheduling entities (processes plus threads), shown as "tasks" in the top border. |
+| Uptime | `clock_gettime(CLOCK_BOOTTIME)` | Same value as `/proc/uptime`, read through the vDSO without a system call. |
 | Temperature | `/sys/class/hwmon/*`, fallback `/sys/class/thermal/thermal_zone*` | See below. |
 | RAM | `/proc/meminfo` | used = MemTotal − MemAvailable, so page cache counts as available. Kernels without `MemAvailable` use Free+Buffers+Cached+SReclaimable. Swap is shown when present. |
 | Network | `/proc/net/dev`, `/proc/net/route`, `/proc/net/ipv6_route`, `/sys/class/net/<if>/{operstate,speed}` | One read of `/proc/net/dev` gives the counters for every interface. |
-| Disk | `/proc/self/mountinfo` + `statvfs()` | Capacity only. Read/write throughput is not measured. |
+| Disk I/O | `/proc/diskstats` | Read and write rates and busy time of whole disks. See below. |
+| Disk space | `/proc/self/mountinfo` + `statvfs()` | |
 | GPU (NVIDIA) | NVML, `libnvidia-ml.so.1`, loaded with `dlopen()` | Utilisation, VRAM, temperature, power and limit, fan, graphics clock. |
 | GPU (AMD) | `/sys/class/drm/cardN/device/` (amdgpu) | Utilisation, VRAM, temperature, power and cap. |
+| Battery, AC | `/sys/class/power_supply/*/uevent` | Only while the `i` or `b` view is open, or for `--once`/`--json`. |
+| System facts | `/etc/os-release`, `uname()`, `/proc/cpuinfo`, `/sys/class/dmi/id/*`, `getifaddrs()` | Only for the `i` view, read the first time it opens. |
 
 ### GPU
 
@@ -142,6 +214,60 @@ Each NVML query costs ioctls, so a shorter interval speeds up CPU, RAM and
 network but not the GPU. One graph column is therefore one GPU sample, which
 can span more time than a column of the CPU graph. Up to 8 GPUs are supported, and each gets a header line, a utilisation bar,
 a history graph and a VRAM bar.
+
+### Disk I/O
+
+One `pread()` of `/proc/diskstats` per refresh gives the counters of every
+block device. dcmon counts only **whole disks**: a device is a whole disk
+when `/sys/block/<name>` exists, and the answer is cached per name, so the
+check costs nothing after the first sample. Partitions, `dm-*` (LVM,
+dm-crypt), `md*` (software RAID), loop, ram, zram and optical drives are
+left out, because their I/O also appears on the disks below them and would
+be counted twice. Disks that have never done any I/O are hidden.
+
+* **Rates:** sectors in `/proc/diskstats` are always 512 bytes. Rates use
+  the same overflow-safe calculation as the network; a counter that goes
+  backwards (driver reload) gives a gap instead of a spike.
+* **Busy:** the share of time with I/O in flight, from the `io_ticks` field.
+  100 % means the device always had a request outstanding, not that it is
+  at its throughput limit (SSDs and NVMe serve many requests in parallel).
+* **Display:** a `DISK I/O` header with total read and write rates, a graph
+  of read + write (scale at least 1 MiB/s, so idle journal writes stay
+  flat), and one row per disk when there is more than one.
+
+### Views: system information and battery
+
+**`i`, system information:** a fastfetch-style summary: user and host,
+distribution, hardware model, kernel, virtualisation (WSL, Docker or Podman
+container, or the hypervisor vendor), uptime, tasks, shell, terminal,
+locale, CPU model with core and thread count and maximum frequency, CPU
+usage and temperature, GPUs with VRAM size, memory, swap, the root
+filesystem, the network interface with its address, and battery and AC
+state. The static facts are read once, the first time the view opens.
+
+* CPU cores are counted from the distinct `physical id`/`core id` pairs in
+  `/proc/cpuinfo`, so hyper-threads are not counted as cores.
+* Placeholder strings from the firmware (`To be filled by O.E.M.`,
+  `Default string`, ...) are dropped from the hardware model.
+
+**`b`, battery:** for every battery: status, charge (bar), level, time to
+empty or to full, power draw, energy now / full, design capacity, health
+(full ÷ design), cycle count, voltage, current, temperature, charge limits,
+technology and serial number. Below that, **every property the driver
+exports** is listed raw from the battery's `uevent` file, in the kernel's
+units (µWh, µAh, µW, µA, µV, tenths of °C). The AC adapter state comes from
+supplies of type `Mains` or `USB`.
+
+* Charge-based batteries (`charge_*` in µAh) are converted to energy with
+  the design voltage, or the current voltage if there is none.
+* Drivers that report current instead of power: power = |current| ×
+  voltage.
+* The time estimates are energy ÷ power, so they jump when the load
+  changes. They are marked "estimate".
+
+Both views refresh with the monitor. While they are open the battery files
+are re-read once a second; while they are closed, neither view costs
+anything.
 
 ### Temperature detection
 
@@ -249,8 +375,8 @@ once per second.
 
 | Technique | Effect |
 |---|---|
-| Kernel files opened once and re-read with `pread(fd, …, 0)` | One syscall per file per refresh, with no open/close. A short read counts as EOF, which avoids an extra zero-length read. |
-| Separate schedules: CPU/RAM/net at the refresh interval, temperature every max(2 s, interval), disks every max(10 s, interval) | Each source is polled only as often as needed. Timers due within 20 ms are merged into one wake-up. |
+| Kernel files opened once and re-read with `pread(fd, …, 0)` | One syscall per file per refresh, with no open/close. A short read under 2 KiB counts as EOF, which avoids an extra zero-length read. (Multi-record procfs files return about one page per read, so a longer short read is followed by one more read. Files whose records can be longer, `mountinfo` and `cpuinfo`, are always read until EOF.) |
+| Separate schedules: CPU/RAM/net/disk I/O at the refresh interval; GPU and CPU frequency every max(1 s, interval); temperature every max(2 s, interval); disk space every max(10 s, interval) | Each source is polled only as often as needed. Timers due within 20 ms are merged into one wake-up. |
 | `timerfd` with `TFD_TIMER_ABSTIME` on `CLOCK_MONOTONIC`, plus `signalfd` | A blocking `poll()` with absolute deadlines: no drift, no busy loop, no signal-handler races. |
 | Fixed 512-sample ring buffers per graph | No allocation per sample, memory bounded for any run length. History survives terminal resizes. |
 | Integer arithmetic for parsing, percentages, byte formatting and temperatures | No floating point in the refresh path. |
@@ -268,12 +394,13 @@ automatically. Colour mode is chosen from `COLORTERM`/`TERM`: 256 colours,
 
 **Layout:**
 
-* 110 columns or wider: two columns (CPU and RAM on the left, network and
-  disks on the right).
+* 110 columns or wider: two columns (CPU, RAM and GPU on the left;
+  network, disk I/O and disk space on the right).
 * Narrower: one column.
 * Spare rows make the graphs taller.
 * When rows run short, dcmon first drops separators, then disk bars, then
-  network totals, and finally enables scrolling.
+  network totals, then the per-disk I/O rows, and finally enables
+  scrolling.
 * Below 40×6 it shows a "terminal too small" message.
 
 ## Reliability
@@ -298,7 +425,7 @@ automatically. Colour mode is chosen from `COLORTERM`/`TERM`: 256 colours,
 make test
 ```
 
-`tests/test.c` contains 624 checks and runs under AddressSanitizer,
+`tests/test.c` contains 763 checks and runs under AddressSanitizer,
 LeakSanitizer and UndefinedBehaviorSanitizer. Each module reads a fixture
 tree of `/proc` and `/sys` files generated in a temporary directory, so
 results do not depend on the host. The suite covers:
@@ -324,7 +451,24 @@ results do not depend on the host. The suite covers:
   * every `nvmlInit` being matched by `nvmlShutdown`.
 * GPU, AMD: amdgpu sysfs fixtures with a connector entry and an Intel card
   that must both be ignored.
-* The command-line parser, including 18 invalid inputs.
+* Disk I/O: whole-disk detection (partitions, loop, dm and never-used
+  disks left out, `cciss/c0d0` mapped to `/sys/block/cciss!c0d0`), rates
+  and busy time, an unplugged disk, a counter reset, a missing file.
+* CPU frequency (average, maximum, cores without cpufreq not retried) and
+  the task counts from `/proc/loadavg`.
+* Batteries: energy- and charge-based batteries, power from current ×
+  voltage, time estimates, health, raw property list, AC adapters, no
+  battery at all.
+* System information: `os-release` variants, `/proc/cpuinfo` topology for
+  x86 (two sockets, hyper-threading) and ARM, DMI placeholders, VM and WSL
+  detection. A regression test reads the real `/proc/cpuinfo`, which
+  returns about one page per read, and checks that every CPU is counted.
+* The command-line parser, including 18 invalid inputs, and the
+  configuration file: precedence, groups, booleans, quoting, errors with
+  file and line, the default path.
+* `--json` output checked by a JSON syntax checker (escaped mount names,
+  `null` for missing values), `--once` free of control characters, and the
+  info and battery views at several terminal sizes.
 * Layout: 16 terminal sizes from 1×1 to 2000×30, in 6 display modes. The
   test checks that every emitted row is exactly the terminal width, that no
   raw control byte reaches the output, and that an unchanged frame emits 0
@@ -334,7 +478,7 @@ results do not depend on the host. The suite covers:
 * A 3000-iteration stress run that changes data and terminal sizes, with
   leak checking.
 * The real binary in a pseudo terminal, quitting through `q`, Ctrl-C,
-  SIGTERM, SIGHUP and every key. The test verifies exit status 0, a
+  SIGTERM, SIGHUP, every key, and switching between all views. The test verifies exit status 0, a
   byte-identical termios afterwards, the alternate screen left, and no
   sanitizer reports. On a machine with an NVIDIA GPU this also exercises
   the real NVML.
@@ -342,7 +486,9 @@ results do not depend on the host. The suite covers:
 NVIDIA's own libraries leak a few hundred bytes once inside
 `pthread_once`. `tests/lsan.supp` suppresses exactly those two libraries,
 so dcmon's own code stays fully leak-checked.
-* Exit codes for invalid arguments and for a non-terminal stdout.
+* Exit codes for invalid arguments, a broken configuration file and a
+  non-terminal stdout; `--json` and `--once` from the real binary without a
+  terminal.
 
 ## Benchmarking
 
@@ -386,22 +532,26 @@ difference described above. All threads are counted.
 
 | Interval | Frames | CPU time | CPU (% of one core) | Peak RSS | Output | Bytes per frame | Syscalls/s | Syscalls per refresh |
 |---|---|---|---|---|---|---|---|---|
-| 250 ms  | 247 | 0.247 s | 0.412 % | 3644 KiB | 4433 B/s | 1077 | 37.5 | 9.4 |
-| 1000 ms |  73 | 0.078 s | 0.130 % | 3580 KiB | 1461 B/s | 1201 | 12.2 | 12.2 |
-| 2000 ms |  43 | 0.048 s | 0.080 % | 3404 KiB |  876 B/s | 1222 |  8.3 | 16.5 |
+| 250 ms  | 247 | 0.120 s | 0.201 % | 3648 KiB | 6291 B/s | 1528 | 41.4 | 10.3 |
+| 1000 ms |  73 | 0.068 s | 0.114 % | 3592 KiB | 2798 B/s | 2300 | 13.5 | 13.5 |
+| 2000 ms |  43 | 0.020 s | 0.034 % | 3612 KiB | 1231 B/s | 1718 |  8.0 | 16.0 |
 
 **With the NVIDIA GPU** (default when NVML is present):
 
 | Interval | Frames | CPU time | CPU (% of one core) | Peak RSS | Output | Bytes per frame | Syscalls/s | Syscalls per refresh |
 |---|---|---|---|---|---|---|---|---|
-| 250 ms  | 246 | 0.227 s | 0.378 % | 27748 KiB | 4308 B/s | 1051 | 49.6 | 12.4 |
-| 1000 ms |  72 | 0.127 s | 0.212 % | 28084 KiB | 2006 B/s | 1671 | 24.4 | 24.4 |
-| 2000 ms |  42 | 0.079 s | 0.132 % | 27724 KiB | 1326 B/s | 1894 | 13.9 | 27.8 |
+| 250 ms  | 246 | 0.216 s | 0.360 % | 27988 KiB | 7250 B/s | 1768 | 53.9 | 13.5 |
+| 1000 ms |  72 | 0.103 s | 0.171 % | 27724 KiB | 2905 B/s | 2421 | 25.6 | 25.6 |
+| 2000 ms |  42 | 0.059 s | 0.099 % | 27768 KiB | 1907 B/s | 2724 | 14.3 | 28.5 |
 
-At 250 ms the GPU is sampled once per second, not four times. Before that
-limit, the same run measured 0.798 % CPU and 86.1 syscalls/s. At 1000 ms
-and above the code path is the same as before, so the CPU differences
-there (0.287 % → 0.212 %, 0.180 % → 0.132 %) are variation between runs.
+These are version 1.1 (disk I/O, uptime and tasks on screen). Compared with
+1.0 on the same machine, the 1.1 run made about 1.3 more syscalls per
+second (one `pread` of `/proc/diskstats` per refresh) and sent more output
+per frame, because the disk I/O rows and the task count in the top border
+change often. The CPU times varied by up to ±30 % between otherwise equal
+runs of the same binary, so they show the order of magnitude, not small
+differences. The GPU is sampled once per second even at 250 ms; before
+that limit a 250 ms run measured 0.798 % CPU and 86.1 syscalls/s.
 
 **What the GPU costs:** NVML is by far the most expensive part of dcmon.
 
@@ -420,20 +570,24 @@ Linux driver uses a different path, so measure it with
 If you don't need the GPU, run `--no-gpu`. The library is then not loaded
 at all. The `g` key only stops the queries; the library stays loaded.
 
-**Executable:** 67,712 bytes stripped (text 56,887, data 3,316). The only
+**Executable:** 100,480 bytes stripped (text 89,628, data 3,844); 1.0 was
+67,712 bytes. Most of the growth is the system information and battery
+views, the snapshot output and the configuration file parser. The only
 dynamic dependency is libc; NVML is loaded with `dlopen()` only when
 present. Without the GPU, most of the ~3.6 MiB peak RSS is glibc and the
 dynamic loader. dcmon's own heap use is a few tens of KiB: the `/proc` read
 buffers, the line buffer and the per-row hashes.
 
-**Syscall mix without GPU:** a 25 s run at 1000 ms made these calls:
+**Syscall mix without GPU:** a 25 s run at 1000 ms, start-up included,
+made these calls:
 
-* 137 `pread64`: `/proc/stat`, `/proc/loadavg`, `/proc/meminfo`,
-  `/proc/net/dev`, operstate.
-* 51 `read`: the timerfd and the probe pipe.
-* 42 `poll`, 38 `timerfd_settime`, 29 `write` (one per frame).
+* 167 `pread64`: `/proc/stat`, `/proc/loadavg`, `/proc/meminfo`,
+  `/proc/net/dev`, `/proc/diskstats`, operstate.
+* 56 `read`: the timerfd and the probe pipe.
+* 45 `poll`, 38 `timerfd_settime`, 29 `write` (one per frame).
 * 6 `statfs`.
-* 14 `openat` and 22 `close`: these come from the 15 s default-route check
+* 27 `openat` and 23 `close`: the start-up opens (including one attempt
+  per CPU to find cpufreq, which WSL2 lacks), the 15 s default-route check
   and the disk-probe pipe.
 
 **Notes:**
@@ -453,11 +607,15 @@ every 2 s.
 
 ```
 src/main.c          event loop, signals, keys
-src/cli.c           argument parsing / validation
-src/cpu.c           /proc/stat, /proc/loadavg
+src/cli.c           argument and configuration file parsing / validation
+src/cpu.c           /proc/stat, /proc/loadavg, cpufreq
 src/memory.c        /proc/meminfo
 src/network.c       /proc/net/dev, routes, operstate
 src/disk.c          mountinfo, statvfs, async probe for network/FUSE mounts
+src/diskio.c        /proc/diskstats: whole-disk read/write rates and busy time
+src/battery.c       /sys/class/power_supply: batteries and AC adapters
+src/sysinfo.c       static machine facts; rows of the info and battery views
+src/report.c        --once (plain text) and --json snapshots
 src/temperature.c   hwmon / thermal-zone discovery and reading
 src/gpu.c           NVIDIA via NVML (dlopen), AMD via amdgpu sysfs
 src/histogram.c     ring buffers and scaling

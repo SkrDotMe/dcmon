@@ -12,10 +12,10 @@ LDLIBS   := -ldl   # dlopen() for NVML; part of libc itself since glibc 2.34
 
 # Size-optimised release build: LTO, dead-section GC, no unwind tables,
 # stripped.  Stack protector and FORTIFY stay on for stability.
-RELEASE_CFLAGS  := $(STD) -Os -flto -s $(WARN) -D_FORTIFY_SOURCE=2 \
+RELEASE_CFLAGS  := $(STD) -Os -flto=auto -s $(WARN) -D_FORTIFY_SOURCE=2 \
                    -ffunction-sections -fdata-sections \
                    -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-ident
-RELEASE_LDFLAGS := -flto -s -Wl,--gc-sections -Wl,-O1 -Wl,--as-needed -Wl,--hash-style=gnu \
+RELEASE_LDFLAGS := -flto=auto -s -Wl,--gc-sections -Wl,-O1 -Wl,--as-needed -Wl,--hash-style=gnu \
                    -Wl,--build-id=none
 
 DEBUG_CFLAGS    := $(STD) -O0 -g3 $(WARN) -fsanitize=address,undefined -fno-omit-frame-pointer

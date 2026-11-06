@@ -46,7 +46,16 @@ void close_fd(int *fd)
     }
 }
 
-ssize_t pread_all(int fd, char *buf, size_t cap)
+/* Multi-record procfs files (seq_file: /proc/net/dev, /proc/diskstats,
+ * /proc/self/mountinfo, /proc/cpuinfo ...) return at most one buffer of
+ * whole records per read(), and that buffer starts at one page.  A short
+ * read of at least SEQ_MORE bytes may therefore be followed by more data;
+ * a shorter one is the end of the file as long as records are shorter than
+ * PAGE_SIZE - SEQ_MORE.  strict mode reads until read() returns 0, for
+ * files whose records can be longer (mountinfo, cpuinfo). */
+#define SEQ_MORE 2048
+
+static ssize_t pread_impl(int fd, char *buf, size_t cap, int strict)
 {
     if (fd < 0 || cap < 2) {
         errno = EBADF;
@@ -65,11 +74,21 @@ ssize_t pread_all(int fd, char *buf, size_t cap)
             return -1;
         }
         len += (size_t)r;
-        if ((size_t)r < want)
-            break; /* short read: EOF for procfs/sysfs/regular files */
+        if (r == 0 || ((size_t)r < want && !strict && (size_t)r < SEQ_MORE))
+            break;
     }
     buf[len] = '\0';
     return (ssize_t)len;
+}
+
+ssize_t pread_all(int fd, char *buf, size_t cap)
+{
+    return pread_impl(fd, buf, cap, 0);
+}
+
+ssize_t pread_eof(int fd, char *buf, size_t cap)
+{
+    return pread_impl(fd, buf, cap, 1);
 }
 
 ssize_t read_path(const char *path, char *buf, size_t cap)
@@ -106,7 +125,7 @@ int read_line(const char *path, char *out, size_t cap)
     return n > 0 ? 0 : -1;
 }
 
-ssize_t gb_pread(gbuf_t *g, int fd, size_t maxcap)
+static ssize_t gb_impl(gbuf_t *g, int fd, size_t maxcap, int strict)
 {
     if (!g->p) {
         g->cap = 4096;
@@ -117,7 +136,7 @@ ssize_t gb_pread(gbuf_t *g, int fd, size_t maxcap)
         }
     }
     for (;;) {
-        ssize_t n = pread_all(fd, g->p, g->cap);
+        ssize_t n = pread_impl(fd, g->p, g->cap, strict);
         if (n < 0)
             return -1;
         if ((size_t)n < g->cap - 1 || g->cap >= maxcap)
@@ -131,6 +150,16 @@ ssize_t gb_pread(gbuf_t *g, int fd, size_t maxcap)
         g->p = np;
         g->cap = nc;
     }
+}
+
+ssize_t gb_pread(gbuf_t *g, int fd, size_t maxcap)
+{
+    return gb_impl(g, fd, maxcap, 0);
+}
+
+ssize_t gb_pread_eof(gbuf_t *g, int fd, size_t maxcap)
+{
+    return gb_impl(g, fd, maxcap, 1);
 }
 
 void gb_free(gbuf_t *g)
@@ -222,4 +251,41 @@ void fmt_mdeg(char *out, size_t cap, int32_t mdeg)
     if (neg)
         t = -t;
     snprintf(out, cap, "%s%d.%d", neg ? "-" : "", (int)(t / 10), (int)(t % 10));
+}
+
+/* "4.21 GHz" / "800 MHz"; short form "4.2G" / "800M" (4 columns). */
+void fmt_khz(char *out, size_t cap, uint32_t khz, int shrt)
+{
+    unsigned mhz = (khz + 500) / 1000;
+    if (shrt) {
+        if (mhz >= 1000)
+            snprintf(out, cap, "%u.%uG", (mhz + 50) / 1000, ((mhz + 50) / 100) % 10);
+        else
+            snprintf(out, cap, "%uM", mhz);
+    } else if (mhz >= 1000) {
+        snprintf(out, cap, "%u.%02u GHz", (mhz + 5) / 1000, ((mhz + 5) / 10) % 100);
+    } else {
+        snprintf(out, cap, "%u MHz", mhz);
+    }
+}
+
+/* "3d 4h 12m", "4h 12m", "12m": minutes, so displays change once a minute */
+void fmt_duration(char *out, size_t cap, uint64_t s)
+{
+    unsigned long long d = s / 86400, h = s / 3600 % 24, m = s / 60 % 60;
+    if (d)
+        snprintf(out, cap, "%llud %lluh %llum", d, h, m);
+    else if (h)
+        snprintf(out, cap, "%lluh %llum", h, m);
+    else
+        snprintf(out, cap, "%llum", m);
+}
+
+/* Time since boot including suspend, like /proc/uptime (vDSO, no syscall). */
+uint64_t uptime_s(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_BOOTTIME, &ts) != 0)
+        return 0;
+    return (uint64_t)ts.tv_sec;
 }

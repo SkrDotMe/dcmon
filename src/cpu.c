@@ -164,17 +164,59 @@ int cpu_sample(cpu_t *c, int push)
             for (; b[i] && b[i] != '\n'; i++)
                 if (b[i] == ' ' && ++sp == 3)
                     break;
-            if (i >= sizeof c->load)
-                i = sizeof c->load - 1;
-            memcpy(c->load, b, i);
-            c->load[i] = '\0';
+            size_t l = i < sizeof c->load ? i : sizeof c->load - 1;
+            memcpy(c->load, b, l);
+            c->load[l] = '\0';
+            /* 4th field: runnable/total scheduling entities ("2/873") */
+            uint64_t r, t;
+            const char *q = b[i] == ' ' ? parse_u64(b + i, &r) : NULL;
+            if (q && *q == '/' && parse_u64(q + 1, &t)) {
+                c->running = (unsigned)r;
+                c->tasks = (unsigned)t;
+            }
         }
     }
     return ok ? 0 : -1;
 }
 
+void cpu_freq_sample(cpu_t *c)
+{
+    uint64_t sum = 0;
+    unsigned n = 0;
+    uint32_t mx = 0;
+    for (unsigned i = 0; i < c->span && i < c->cap; i++) {
+        cpu_slot_t *s = &c->core[i];
+        s->khz = 0;
+        if (!s->online || s->ffd < 0)
+            continue;
+        if (s->ffd == 0) {
+            char p[512];
+            int fd = -1;
+            if (root_path(p, sizeof p, "/sys/devices/system/cpu/cpu%u/cpufreq/scaling_cur_freq", i) == 0)
+                fd = open_ro(p);
+            s->ffd = fd >= 0 ? fd + 1 : -1;
+            if (fd < 0)
+                continue;
+        }
+        char b[32];
+        uint64_t v;
+        if (pread_all(s->ffd - 1, b, sizeof b) > 0 && parse_u64(b, &v) && v > 0 && v < 100000000) {
+            s->khz = (uint32_t)v;
+            sum += v;
+            n++;
+            if (s->khz > mx)
+                mx = s->khz;
+        }
+    }
+    c->khz_avg = n ? (uint32_t)(sum / n) : 0;
+    c->khz_max = mx;
+}
+
 void cpu_free(cpu_t *c)
 {
+    for (unsigned i = 0; i < c->cap; i++)
+        if (c->core && c->core[i].ffd > 0)
+            close(c->core[i].ffd - 1);
     close_fd(&c->fd);
     close_fd(&c->fd_load);
     gb_free(&c->gb);

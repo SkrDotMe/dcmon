@@ -24,6 +24,7 @@
 
 #include "app.h"
 #include "renderer.h"
+#include "report.h"
 #include "terminal.h"
 #include "util.h"
 
@@ -757,6 +758,369 @@ static void test_gpu(void)
     gpu_free(&g);
 }
 
+/* ---- disk I/O --------------------------------------------------------------- */
+
+static void diskstats(uint64_t sda_rd, uint64_t sda_wr, uint64_t sda_ticks, int with_usb)
+{
+    fx_write("/proc/diskstats",
+             "   7       0 loop0 50 0 800 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+             "   8       0 sda 100 0 %llu 0 200 0 %llu 0 0 %llu 0 0 0 0 0 0 0\n"
+             "   8       1 sda1 90 0 %llu 0 190 0 %llu 0 0 %llu 0 0 0 0 0 0 0\n"
+             " 259       0 nvme0n1 10 0 80 0 0 0 0 0 0 5 0\n"
+             " 259       1 nvme1n1 0 0 0 0 0 0 0 0 0 0 0\n"
+             " 253       0 dm-0 70 0 %llu 0 180 0 %llu 0 0 0 0\n"
+             " 104       0 cciss/c0d0 1 0 8 0 1 0 8 0 0 1 0\n"
+             "%s",
+             (unsigned long long)sda_rd, (unsigned long long)sda_wr, (unsigned long long)sda_ticks,
+             (unsigned long long)sda_rd, (unsigned long long)sda_wr, (unsigned long long)sda_ticks,
+             (unsigned long long)sda_rd, (unsigned long long)sda_wr,
+             with_usb ? "   8      16 sdb 5 0 40 0 0 0 0 0 0 1 0\n" : "");
+}
+
+static void test_diskio(void)
+{
+    fx_reset();
+    fx_write("/sys/block/sda/size", "1\n");
+    fx_write("/sys/block/sdb/size", "1\n");
+    fx_write("/sys/block/nvme0n1/size", "1\n");
+    fx_write("/sys/block/nvme1n1/size", "1\n");
+    fx_write("/sys/block/loop0/size", "1\n");
+    fx_write("/sys/block/dm-0/size", "1\n");
+    fx_write("/sys/block/cciss!c0d0/size", "1\n");
+    diskstats(1000, 2000, 100, 1);
+
+    dio_t d;
+    memset(&d, 0, sizeof d);
+    d.fd = -1;
+    char buf[4096];
+    snprintf(buf, sizeof buf, "%s/proc/diskstats", g_tmp);
+    read_path(buf, buf, sizeof buf);
+    CHECK(dio_parse(&d, buf, 1000 * NS_PER_MS) == 0);
+    /* whole disks with I/O: sda, nvme0n1, cciss/c0d0, sdb; not loop, dm,
+     * partitions or the never-used nvme1n1 */
+    CHECK(d.n == 4);
+    CHECK_STR(d.d[0].name, "sda");
+    CHECK_STR(d.d[1].name, "nvme0n1");
+    CHECK_STR(d.d[2].name, "cciss/c0d0");
+    CHECK(!d.ok); /* first sample: no rates yet */
+    CHECK(dio_is_whole(&d, "sda1") == 0);
+
+    /* +2048 sectors read (1 MiB), +4096 written (2 MiB), 500 ms busy in 1 s;
+     * sdb unplugged */
+    diskstats(1000 + 2048, 2000 + 4096, 600, 0);
+    snprintf(buf, sizeof buf, "%s/proc/diskstats", g_tmp);
+    read_path(buf, buf, sizeof buf);
+    CHECK(dio_parse(&d, buf, 2000 * NS_PER_MS) == 0);
+    CHECK(d.n == 3);
+    CHECK(d.ok);
+    CHECK(d.d[0].rd_rate == 1048576 && d.d[0].wr_rate == 2097152);
+    CHECK(d.d[0].busy_pm == 500);
+    CHECK(d.rd_rate == 1048576 && d.wr_rate == 2097152);
+
+    /* counter reset (driver reload): no bogus rate */
+    diskstats(10, 10, 0, 0);
+    snprintf(buf, sizeof buf, "%s/proc/diskstats", g_tmp);
+    read_path(buf, buf, sizeof buf);
+    dio_parse(&d, buf, 3000 * NS_PER_MS);
+    CHECK(!d.d[0].ok && !d.ok);
+    CHECK(dio_parse(&d, "garbage\n\n", 4000 * NS_PER_MS) == -1 && d.n == 0);
+
+    /* through the module: fd, histogram */
+    diskstats(1000, 2000, 100, 0);
+    dio_t m;
+    CHECK(dio_init(&m) == 0 && m.n == 3);
+    diskstats(1000 + 2048, 2000, 100, 0);
+    usleep(2000);
+    dio_sample(&m, 1);
+    CHECK(m.hist.count == 1 && hist_get(&m.hist, 0) != HIST_NONE && m.rd_rate > 0);
+    dio_free(&m);
+    fx_reset();
+    CHECK(dio_init(&m) == -1); /* no /proc/diskstats */
+    dio_sample(&m, 1);
+    CHECK(hist_get(&m.hist, 0) == HIST_NONE);
+    dio_free(&m);
+}
+
+/* ---- CPU frequency, tasks, uptime ------------------------------------------- */
+
+static void test_cpufreq(void)
+{
+    fx_reset();
+    fx_write("/proc/stat", "cpu  1 0 1 10 0 0 0 0\ncpu0 1 0 0 5 0 0 0 0\ncpu1 0 0 1 5 0 0 0 0\n"
+                           "cpu2 0 0 0 1 0 0 0 0\n");
+    fx_write("/proc/loadavg", "0.52 0.48 0.40 3/873 4567\n");
+    fx_write("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", "4200000\n");
+    fx_write("/sys/devices/system/cpu/cpu1/cpufreq/scaling_cur_freq", "800000\n");
+    /* cpu2 has no cpufreq directory */
+    cpu_t c;
+    cpu_init(&c);
+    CHECK_STR(c.load, "0.52 0.48 0.40");
+    CHECK(c.tasks == 873 && c.running == 3);
+    cpu_freq_sample(&c);
+    CHECK(c.core[0].khz == 4200000 && c.core[1].khz == 800000 && c.core[2].khz == 0);
+    CHECK(c.khz_avg == 2500000 && c.khz_max == 4200000);
+    CHECK(c.core[2].ffd == -1); /* not retried every refresh */
+    fx_write("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", "3000000\n");
+    cpu_freq_sample(&c);
+    CHECK(c.core[0].khz == 3000000);
+    cpu_free(&c);
+
+    /* malformed 4th field leaves the counts alone */
+    fx_write("/proc/loadavg", "0.10 0.20 0.30 x/y 1\n");
+    cpu_init(&c);
+    CHECK(c.tasks == 0 && c.load[0]);
+    cpu_freq_sample(&c);
+    cpu_free(&c);
+
+    char b[32];
+    fmt_khz(b, sizeof b, 4213000, 0);
+    CHECK_STR(b, "4.21 GHz");
+    fmt_khz(b, sizeof b, 4213000, 1);
+    CHECK_STR(b, "4.2G");
+    fmt_khz(b, sizeof b, 799600, 1);
+    CHECK_STR(b, "800M");
+    fmt_khz(b, sizeof b, 999999, 0);
+    CHECK_STR(b, "1.00 GHz");
+    fmt_duration(b, sizeof b, 3 * 86400 + 4 * 3600 + 12 * 60 + 5);
+    CHECK_STR(b, "3d 4h 12m");
+    fmt_duration(b, sizeof b, 65);
+    CHECK_STR(b, "1m");
+    CHECK(uptime_s() > 0);
+}
+
+/* ---- battery ----------------------------------------------------------------- */
+
+static void test_battery(void)
+{
+    fx_reset();
+    battery_t b;
+    battery_scan(&b);
+    CHECK(b.n == 0 && b.ac == -1); /* no power_supply class at all */
+
+    fx_write("/sys/class/power_supply/AC/type", "Mains\n");
+    fx_write("/sys/class/power_supply/AC/online", "0\n");
+    fx_write("/sys/class/power_supply/BAT1/type", "Battery\n");
+    fx_write("/sys/class/power_supply/BAT1/uevent",
+             "POWER_SUPPLY_NAME=BAT1\nPOWER_SUPPLY_TYPE=Battery\nPOWER_SUPPLY_STATUS=Discharging\n"
+             "POWER_SUPPLY_PRESENT=1\nPOWER_SUPPLY_TECHNOLOGY=Li-ion\nPOWER_SUPPLY_CYCLE_COUNT=123\n"
+             "POWER_SUPPLY_VOLTAGE_MIN_DESIGN=11400000\nPOWER_SUPPLY_VOLTAGE_NOW=12000000\n"
+             "POWER_SUPPLY_POWER_NOW=10000000\nPOWER_SUPPLY_ENERGY_FULL_DESIGN=57000000\n"
+             "POWER_SUPPLY_ENERGY_FULL=51300000\nPOWER_SUPPLY_ENERGY_NOW=25000000\n"
+             "POWER_SUPPLY_CAPACITY=48\nPOWER_SUPPLY_CAPACITY_LEVEL=Normal\n"
+             "POWER_SUPPLY_MODEL_NAME=5B10W13930\nPOWER_SUPPLY_MANUFACTURER=SMP\n"
+             "POWER_SUPPLY_SERIAL_NUMBER= 1234\nPOWER_SUPPLY_CHARGE_CONTROL_END_THRESHOLD=80\n"
+             "POWER_SUPPLY_TEMP=312\nnot a property\n");
+    /* charge-based battery that reports current instead of power */
+    fx_write("/sys/class/power_supply/BAT0/type", "Battery\n");
+    fx_write("/sys/class/power_supply/BAT0/uevent",
+             "POWER_SUPPLY_STATUS=Charging\nPOWER_SUPPLY_CURRENT_NOW=-2000000\n"
+             "POWER_SUPPLY_VOLTAGE_NOW=12000000\nPOWER_SUPPLY_CHARGE_NOW=1000000\n"
+             "POWER_SUPPLY_CHARGE_FULL=4000000\n");
+    fx_write("/sys/class/power_supply/hidpp_battery_0/type", "Battery\n"); /* no uevent: skipped */
+    fx_write("/sys/class/power_supply/ucsi-source-psy-1/type", "USB\n");
+    fx_write("/sys/class/power_supply/ucsi-source-psy-1/online", "1\n");
+
+    battery_scan(&b);
+    CHECK(b.n == 2);
+    CHECK_STR(b.d[0].name, "BAT0"); /* sorted */
+    CHECK(b.ac == 1);               /* any online adapter counts */
+    const bat_dev_t *d = &b.d[1];
+    CHECK_STR(bat_get(d, "status"), "Discharging");
+    CHECK(bat_get(d, "name") == NULL); /* NAME is not a property */
+    CHECK(bat_get(d, "nonexistent") == NULL);
+    int64_t x;
+    CHECK(bat_i64(d, "cycle_count", &x) && x == 123);
+    CHECK(!bat_i64(d, "technology", &x));
+    CHECK(bat_power_uw(d, &x) && x == 10000000);
+    CHECK(bat_energy_uwh(d, "full_design", &x) && x == 57000000);
+    int ch;
+    CHECK(bat_minutes_left(d, &x, &ch) && !ch && x == 150); /* 25 Wh at 10 W */
+
+    const bat_dev_t *c0 = &b.d[0];
+    CHECK(bat_power_uw(c0, &x) && x == 24000000);        /* |-2 A| * 12 V */
+    CHECK(bat_energy_uwh(c0, "now", &x) && x == 12000000); /* 1 Ah * 12 V */
+    CHECK(bat_minutes_left(c0, &x, &ch) && ch && x == 90); /* 36 Wh to go at 24 W */
+
+    /* the battery view lists derived values and every raw property */
+    static app_t a;
+    memset(&a, 0, sizeof a);
+    a.bat = b;
+    a.utf8 = 1;
+    a.view = VIEW_BAT;
+    view_battery(&a, &a.kv);
+    int health = 0, raw = 0, limit = 0, ac = 0;
+    for (unsigned i = 0; i < a.kv.n; i++) {
+        if (!strcmp(a.kv.r[i].k, "Health") && strstr(a.kv.r[i].v, "90.0%"))
+            health = 1;
+        if (!strcmp(a.kv.r[i].k, "capacity_level"))
+            raw = 1;
+        if (!strcmp(a.kv.r[i].k, "Charge limit") && strstr(a.kv.r[i].v, "80%"))
+            limit = 1;
+        if (!strcmp(a.kv.r[i].k, "AC adapter") && strstr(a.kv.r[i].v, "online"))
+            ac = 1;
+    }
+    CHECK(health && raw && limit && ac);
+
+    fx_reset();
+    battery_scan(&a.bat);
+    view_battery(&a, &a.kv);
+    CHECK(a.kv.n == 1 && strstr(a.kv.r[0].v, "no battery") != NULL);
+}
+
+/* ---- system information ------------------------------------------------------ */
+
+static void test_sysinfo(void)
+{
+    char o[96];
+    CHECK(sysinfo_os_release("NAME=\"Ubuntu\"\nPRETTY_NAME=\"Ubuntu 26.04.1 LTS\"\n", o, sizeof o));
+    CHECK_STR(o, "Ubuntu 26.04.1 LTS");
+    CHECK(sysinfo_os_release("NAME=Alpine\nVERSION_ID=3.20.1\n", o, sizeof o));
+    CHECK_STR(o, "Alpine 3.20.1");
+    CHECK(sysinfo_os_release("NAME='Arch Linux'\n", o, sizeof o));
+    CHECK_STR(o, "Arch Linux");
+    CHECK(!sysinfo_os_release("ID=x\n", o, sizeof o));
+
+    /* two sockets, two cores each, hyper-threading */
+    char ci[4096] = "";
+    for (int p = 0; p < 8; p++) {
+        char l[256];
+        snprintf(l, sizeof l,
+                 "processor\t: %d\nmodel name\t: Intel(R)  Xeon(R)   CPU E5-2670\nphysical id\t: %d\n"
+                 "core id\t\t: %d\nflags\t\t: fpu hypervisor\n\n",
+                 p, p / 4, (p / 2) % 2);
+        strcat(ci, l);
+    }
+    sysinfo_t s;
+    memset(&s, 0, sizeof s);
+    sysinfo_cpuinfo(&s, ci);
+    CHECK_STR(s.cpu, "Intel(R) Xeon(R) CPU E5-2670");
+    CHECK(s.threads == 8 && s.cores == 4 && s.sockets == 2);
+
+    /* ARM: no model name, no topology */
+    memset(&s, 0, sizeof s);
+    sysinfo_cpuinfo(&s, "processor\t: 0\nBogoMIPS\t: 108.00\n\nprocessor\t: 1\n\nHardware\t: BCM2835\n");
+    CHECK_STR(s.cpu, "BCM2835");
+    CHECK(s.threads == 2 && s.cores == 2);
+
+    /* whole loader against a fixture tree */
+    fx_reset();
+    fx_write("/etc/os-release", "PRETTY_NAME=\"Test OS 1\"\n");
+    fx_write("/proc/cpuinfo", "%s", ci);
+    fx_write("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq", "3300000\n");
+    fx_write("/sys/class/dmi/id/sys_vendor", "QEMU\n");
+    fx_write("/sys/class/dmi/id/product_name", "Standard PC (Q35 + ICH9, 2009)\n");
+    fx_write("/sys/class/dmi/id/product_version", "To be filled by O.E.M.\n");
+    fx_write("/proc/sys/kernel/osrelease", "6.8.0-generic\n");
+    sysinfo_load(&s);
+    CHECK_STR(s.os, "Test OS 1");
+    CHECK_STR(s.model, "QEMU Standard PC (Q35 + ICH9, 2009)");
+    CHECK_STR(s.virt, "virtual machine (QEMU)");
+    CHECK(s.max_khz == 3300000 && s.loaded);
+    fx_write("/proc/sys/kernel/osrelease", "6.18.54.1-microsoft-standard-WSL2\n");
+    sysinfo_load(&s);
+    CHECK_STR(s.virt, "WSL2");
+    fx_reset();
+    sysinfo_load(&s); /* nothing readable: still sane */
+    CHECK_STR(s.os, "Linux");
+    CHECK(s.cpu[0] != '\0');
+    sysinfo_ip(&s, "lo");
+    CHECK(strncmp(s.ip, "127.", 4) == 0 || s.ip[0] == '\0');
+    sysinfo_ip(&s, "no-such-if0");
+    CHECK(s.ip[0] == '\0');
+
+    /* The real /proc/cpuinfo is a multi-record seq_file that returns about a
+     * page per read(): every CPU must still be seen (regression test). */
+    char saved[256];
+    snprintf(saved, sizeof saved, "%s", g_root);
+    g_root[0] = '\0';
+    memset(&s, 0, sizeof s);
+    sysinfo_load(&s);
+    long online = sysconf(_SC_NPROCESSORS_ONLN);
+    if (s.threads != (unsigned)online)
+        fprintf(stderr, "  cpuinfo: %u threads, sysconf %ld\n", s.threads, online);
+    CHECK(s.threads == (unsigned)online);
+    snprintf(g_root, sizeof g_root, "%s", saved);
+}
+
+/* ---- configuration file ------------------------------------------------------ */
+
+static int cfgfile(config_t *c, char *err, const char *text, ...)
+{
+    char path[512];
+    snprintf(path, sizeof path, "%s/config", g_tmp);
+    FILE *f = fopen(path, "w");
+    fputs(text, f);
+    fclose(f);
+    char *argv[16] = {"dcmon"};
+    int argc = 1;
+    va_list ap;
+    va_start(ap, text);
+    char *a;
+    while ((a = va_arg(ap, char *)) != NULL && argc < 15)
+        argv[argc++] = a;
+    va_end(ap);
+    if (cli_parse(argc, argv, c, err, 256) != CLI_RUN)
+        return -2;
+    return cli_config(c, path, err, 256);
+}
+
+static void test_config(void)
+{
+    fx_reset();
+    config_t c;
+    char err[256];
+    CHECK(cfgfile(&c, err, "# comment\n\n  interval = 500  \ninterface=wlan0\nno-gpu\nascii = no\n"
+                           "cores = off\ndisk-details = yes\ntemp-hot = 90\nmount = \"/home\"\nmount=/\n",
+                  NULL) == 0);
+    CHECK(c.interval_ms == 500 && !strcmp(c.iface, "wlan0") && c.no_gpu && !c.ascii);
+    CHECK(c.ui_cores == 0 && c.ui_disk_details == 1 && c.ui_temp_details == -1 && c.ui_gpu == -1);
+    CHECK(c.temp_hot == 90000 && c.temp_warn == 75000);
+    CHECK(c.nmounts == 2 && !strcmp(c.mounts[0], "/home"));
+
+    /* the command line wins, option by option; mounts as a group */
+    CHECK(cfgfile(&c, err, "interval = 500\nno-colors\nmount = /home\ntemp-warn = 60\n", "-i", "2000",
+                  "--all-mounts", "--temp-hot", "95", NULL) == 0);
+    CHECK(c.interval_ms == 2000 && c.no_colors && c.all_mounts && c.nmounts == 0);
+    CHECK(c.temp_hot == 95000 && c.temp_warn == 80000); /* thresholds as a group too */
+    CHECK(cfgfile(&c, err, "all-mounts\n", "--mount", "/", NULL) == 0);
+    CHECK(!c.all_mounts && c.nmounts == 1);
+
+    /* errors name the file and the line */
+    CHECK(cfgfile(&c, err, "interval = 500\nbogus = 1\n", NULL) == -1);
+    CHECK(strstr(err, "config:2:") && strstr(err, "unknown option"));
+    CHECK(cfgfile(&c, err, "interval = 5\n", NULL) == -1 && strstr(err, "invalid interval"));
+    CHECK(cfgfile(&c, err, "interval\n", NULL) == -1 && strstr(err, "requires a value"));
+    CHECK(cfgfile(&c, err, "no-gpu = maybe\n", NULL) == -1 && strstr(err, "invalid value"));
+    CHECK(cfgfile(&c, err, "once\n", NULL) == -1);    /* command line only */
+    CHECK(cfgfile(&c, err, "all-mounts\nmount = /\n", NULL) == -1);
+    CHECK(cfgfile(&c, err, "temp-warn = 90\ntemp-hot = 80\n", NULL) == -1);
+    CHECK(cfgfile(&c, err, "--interval = 250\n", NULL) == 0 && c.interval_ms == 250);
+
+    /* explicit file must exist; the default one may be missing */
+    char p[600];
+    snprintf(p, sizeof p, "%s/nope", g_tmp);
+    CHECK(cli_config(&c, p, err, sizeof err) == -1 && strstr(err, "cannot read"));
+    char *home = getenv("HOME") ? strdup(getenv("HOME")) : NULL, *xdg = getenv("XDG_CONFIG_HOME") ? strdup(getenv("XDG_CONFIG_HOME")) : NULL;
+    setenv("XDG_CONFIG_HOME", g_tmp, 1);
+    cli_config_path(p, sizeof p);
+    CHECK(strstr(p, "/dcmon/config") && !strncmp(p, g_tmp, strlen(g_tmp)));
+    CHECK(cli_config(&c, NULL, err, sizeof err) == 0);
+    fx_write("/dcmon/config", "interval = 3000\n");
+    char *argv[] = {"dcmon", NULL};
+    cli_parse(1, argv, &c, err, sizeof err);
+    CHECK(cli_config(&c, NULL, err, sizeof err) == 0 && c.interval_ms == 3000);
+    unsetenv("XDG_CONFIG_HOME");
+    setenv("HOME", "/nonexistent-home", 1);
+    cli_config_path(p, sizeof p);
+    CHECK_STR(p, "/nonexistent-home/.config/dcmon/config");
+    if (home)
+        setenv("HOME", home, 1);
+    if (xdg)
+        setenv("XDG_CONFIG_HOME", xdg, 1);
+    free(home);
+    free(xdg);
+}
+
 /* ---- CLI ----------------------------------------------------------------- */
 
 static int parse(config_t *c, char *err, ...)
@@ -810,6 +1174,169 @@ static void test_cli(void)
     CHECK(parse(&c, err, "--temp-hot", "500", NULL) == CLI_ERROR);
     CHECK(parse(&c, err, "--no-colors=yes", NULL) == CLI_ERROR);
     CHECK(parse(&c, err, "--duration", "-1", NULL) == CLI_ERROR);
+
+    CHECK(parse(&c, err, "--once", NULL) == CLI_RUN && c.once && !c.json);
+    CHECK(parse(&c, err, "--json", "--no-config", NULL) == CLI_RUN && c.json && c.no_config);
+    CHECK(parse(&c, err, "--config", "/x/y", NULL) == CLI_RUN && !strcmp(c.config, "/x/y"));
+    CHECK(parse(&c, err, "--config", "/x", "--no-config", NULL) == CLI_ERROR);
+    CHECK(parse(&c, err, "--cores", NULL) == CLI_ERROR); /* configuration file only */
+    CHECK(parse(&c, err, NULL) == CLI_RUN && c.ui_cores == -1 && c.ui_gpu == -1);
+}
+
+/* ---- --once / --json ---------------------------------------------------------- */
+
+/* rendering helpers, defined with the rendering tests below */
+static app_t  g_app;
+static char   g_out[1 << 21];
+static void   setup_app(app_t *a);
+static void   teardown_app(app_t *a);
+static size_t capture(app_t *a);
+static int    verify_rows(const char *s, size_t n, int W, int H, int *rows_painted);
+
+/* Minimal JSON syntax checker: enough to prove the output parses. */
+static const char *jv(const char *p);
+static const char *jws(const char *p)
+{
+    while (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r')
+        p++;
+    return p;
+}
+static const char *jstr_ok(const char *p)
+{
+    if (*p++ != '"')
+        return NULL;
+    while (*p && *p != '"') {
+        if ((unsigned char)*p < 0x20)
+            return NULL;
+        if (*p == '\\') {
+            p++;
+            if (*p == 'u') {
+                for (int i = 1; i <= 4; i++)
+                    if (!strchr("0123456789abcdefABCDEF", p[i]) || !p[i])
+                        return NULL;
+                p += 4;
+            } else if (!strchr("\"\\/bfnrt", *p) || !*p) {
+                return NULL;
+            }
+        }
+        p++;
+    }
+    return *p == '"' ? p + 1 : NULL;
+}
+static const char *jv(const char *p)
+{
+    p = jws(p);
+    if (*p == '{' || *p == '[') {
+        char close = *p == '{' ? '}' : ']';
+        int obj = *p == '{';
+        p = jws(p + 1);
+        if (*p == close)
+            return p + 1;
+        for (;;) {
+            if (obj) {
+                p = jstr_ok(jws(p));
+                if (!p)
+                    return NULL;
+                p = jws(p);
+                if (*p++ != ':')
+                    return NULL;
+            }
+            p = jv(p);
+            if (!p)
+                return NULL;
+            p = jws(p);
+            if (*p == ',') {
+                p++;
+                continue;
+            }
+            return *p == close ? p + 1 : NULL;
+        }
+    }
+    if (*p == '"')
+        return jstr_ok(p);
+    if (!strncmp(p, "true", 4) || !strncmp(p, "null", 4))
+        return p + 4;
+    if (!strncmp(p, "false", 5))
+        return p + 5;
+    const char *s = p;
+    if (*p == '-')
+        p++;
+    if (*p < '0' || *p > '9')
+        return NULL;
+    while ((*p >= '0' && *p <= '9') || *p == '.')
+        p++;
+    return p > s ? p : NULL;
+}
+static int json_ok(const char *s)
+{
+    const char *e = jv(s);
+    return e && *jws(e) == '\0';
+}
+
+static void test_report(void)
+{
+    CHECK(json_ok("{\"a\":[1,2.5,-3,null,true,false,\"x\\u001b\"],\"b\":{}}"));
+    CHECK(!json_ok("{\"a\":[1,2,]}"));
+    CHECK(!json_ok("{\"a\":\"\x1b\"}"));
+
+    app_t *a = &g_app;
+    setup_app(a);
+    fx_write("/sys/class/power_supply/BAT0/type", "Battery\n");
+    fx_write("/sys/class/power_supply/BAT0/uevent",
+             "POWER_SUPPLY_STATUS=Discharging\nPOWER_SUPPLY_CAPACITY=55\nPOWER_SUPPLY_POWER_NOW=8000000\n"
+             "POWER_SUPPLY_ENERGY_NOW=20000000\nPOWER_SUPPLY_MODEL_NAME=\"quoted\\\x01\"\n");
+    battery_scan(&a->bat);
+    dio_init(&a->dio);
+    cpu_freq_sample(&a->cpu);
+    char path[512];
+    snprintf(path, sizeof path, "%s/report", g_tmp);
+    static char buf[1 << 16];
+
+    FILE *f = fopen(path, "w");
+    report_json(a, f);
+    fclose(f);
+    read_path(path, buf, sizeof buf);
+    int ok = json_ok(buf);
+    if (!ok)
+        fprintf(stderr, "  invalid JSON:\n%s\n", buf);
+    CHECK(ok);
+    CHECK(strstr(buf, "\"gpus\":[{\"name\":") != NULL);       /* fake NVML GPUs */
+    CHECK(strstr(buf, "\"capacity_pct\":55") != NULL);
+    CHECK(strstr(buf, "\"minutes_left\":150") != NULL);
+    CHECK(strstr(buf, "\\u001b[31m") != NULL);                /* escaped, not raw */
+    CHECK(strstr(buf, "\"load\":[1.") != NULL);
+
+    f = fopen(path, "w");
+    report_text(a, f);
+    fclose(f);
+    size_t n = (size_t)read_path(path, buf, sizeof buf);
+    int ctl = 0;
+    for (size_t i = 0; i < n; i++)
+        if ((unsigned char)buf[i] < 0x20 && buf[i] != '\n')
+            ctl++;
+    CHECK(ctl == 0); /* no escape sequences from mount names */
+    CHECK(strstr(buf, "CPU") && strstr(buf, "Memory") && strstr(buf, "Battery    BAT0 55% Discharging"));
+
+    /* all views render at every size */
+    static const int sizes[][2] = {{40, 6}, {60, 20}, {120, 40}, {300, 100}};
+    for (int v = VIEW_INFO; v <= VIEW_BAT; v++) {
+        a->view = v;
+        if (v == VIEW_INFO)
+            sysinfo_load(&a->si);
+        for (size_t k = 0; k < sizeof sizes / sizeof sizes[0]; k++) {
+            a->cols = sizes[k][0];
+            a->rows = sizes[k][1];
+            render_invalidate(1);
+            size_t m = capture(a);
+            int painted;
+            CHECK(verify_rows(g_out, m, a->cols, a->rows, &painted) == 0 && painted == a->rows);
+            CHECK(capture(a) == 0);
+        }
+    }
+    a->view = VIEW_MAIN;
+    dio_free(&a->dio);
+    teardown_app(a);
+    render_free();
 }
 
 /* ---- rendering / layout -------------------------------------------------- */
@@ -954,7 +1481,7 @@ static void test_render(void)
                                    {109, 40}, {110, 40}, {120, 50}, {200, 60}, {300, 100},
                                    {512, 200}, {39, 10}, {80, 5},  {1, 1},   {2000, 30}};
     for (int mode = 0; mode < 6; mode++) {
-        a->help = mode == 1;
+        a->view = mode == 1 ? VIEW_HELP : VIEW_MAIN;
         a->utf8 = mode != 2;
         a->color_mode = mode == 3 ? 0 : mode == 4 ? 1 : 2;
         a->cores = mode != 5;
@@ -980,7 +1507,7 @@ static void test_render(void)
     }
 
     /* scrolling: tiny terminal, many rows */
-    a->help = 0;
+    a->view = VIEW_MAIN;
     a->utf8 = 1;
     a->cols = 60;
     a->rows = 8;
@@ -1116,9 +1643,9 @@ static int run_in_pty(const char *bin, const char *keys, int sig, struct termios
         setenv("TERM", "xterm-256color", 1);
         setenv("ASAN_OPTIONS", "detect_leaks=1", 1);
         /* LSAN_OPTIONS (suppressions for NVIDIA's libraries) is inherited */
-        char *argv[16] = {(char *)bin, "--duration", "20"};
-        int ac = 3;
-        for (int i = 0; extra && extra[i] && ac < 15; i++)
+        char *argv[20] = {(char *)bin, "--duration", "20", "--no-config"};
+        int ac = 4;
+        for (int i = 0; extra && extra[i] && ac < 19; i++)
             argv[ac++] = extra[i];
         argv[ac] = NULL;
         execv(bin, argv);
@@ -1193,6 +1720,7 @@ static void test_terminal_restore(void)
         {NULL, SIGTERM, "SIGTERM"},
         {NULL, SIGHUP, "SIGHUP"},
         {"h+-rndctjk\x1b[A\x1b[Bq", 0, "all keys"},
+        {"ibbiigh\x1b" "b\x1b[6~\x1b[5~\x1bq", 0, "views"},
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         int st = run_in_pty(g_bin, cases[i].keys, cases[i].sig, &before, &after, out, sizeof out, NULL);
@@ -1241,6 +1769,54 @@ static void test_binary_cli(void)
     int st;
     waitpid(p, &st, 0);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 1);
+
+    /* --json / --once work without a terminal and print valid output */
+    static const char *modes[] = {"--json", "--once"};
+    for (int m = 0; m < 2; m++) {
+        int pfd[2];
+        if (pipe(pfd) != 0)
+            return;
+        p = fork();
+        if (p == 0) {
+            int dn = open("/dev/null", O_RDWR);
+            dup2(dn, 0);
+            dup2(pfd[1], 1);
+            close(pfd[0]);
+            execl(g_bin, g_bin, modes[m], "--no-config", "--no-gpu", "--interval", "200", (char *)NULL);
+            _exit(127);
+        }
+        close(pfd[1]);
+        static char out[1 << 16];
+        size_t len = 0;
+        ssize_t r;
+        while ((r = read(pfd[0], out + len, sizeof out - 1 - len)) > 0)
+            len += (size_t)r;
+        out[len] = '\0';
+        close(pfd[0]);
+        waitpid(p, &st, 0);
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        if (m == 0)
+            CHECK(json_ok(out) && strstr(out, "\"cpu\":{"));
+        else
+            CHECK(strncmp(out, "dcmon ", 6) == 0 && strstr(out, "\nCPU "));
+    }
+
+    /* a broken configuration file is reported with exit code 2 */
+    char cf[512];
+    snprintf(cf, sizeof cf, "%s/bad.conf", g_tmp);
+    FILE *f = fopen(cf, "w");
+    fputs("interval = fast\n", f);
+    fclose(f);
+    p = fork();
+    if (p == 0) {
+        int dn = open("/dev/null", O_RDWR);
+        dup2(dn, 1);
+        dup2(dn, 2);
+        execl(g_bin, g_bin, "--json", "--config", cf, (char *)NULL);
+        _exit(127);
+    }
+    waitpid(p, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 2);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1267,8 +1843,14 @@ int main(int argc, char **argv)
     RUN(test_disk);
     RUN(test_temperature);
     RUN(test_gpu);
+    RUN(test_diskio);
+    RUN(test_cpufreq);
+    RUN(test_battery);
+    RUN(test_sysinfo);
     RUN(test_cli);
+    RUN(test_config);
     RUN(test_render);
+    RUN(test_report);
     RUN(test_eintr);
     RUN(test_long_run);
     g_root[0] = '\0';

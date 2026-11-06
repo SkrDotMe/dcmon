@@ -234,7 +234,7 @@ void disk_discover(disks_t *ds)
         ds->n = ds->nonly;
     }
 
-    ssize_t len = ds->fd_mi >= 0 ? gb_pread(&ds->gb, ds->fd_mi, MI_MAX) : -1;
+    ssize_t len = ds->fd_mi >= 0 ? gb_pread_eof(&ds->gb, ds->fd_mi, MI_MAX) : -1;
     if (len > 0) {
         char *p = ds->gb.p;
         while (p && *p) {

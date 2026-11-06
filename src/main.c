@@ -15,15 +15,17 @@
 #include <sys/resource.h>
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "app.h"
 #include "renderer.h"
+#include "report.h"
 #include "terminal.h"
 #include "util.h"
 
 #define SLACK_NS     (20 * NS_PER_MS) /* coalesce timers due within 20 ms */
-#define GPU_IV_MS    1000u            /* NVML calls cost ioctls: max 1/s   */
+#define SLOW_IV_MS   1000u            /* GPU (NVML ioctls), CPU frequency  */
 #define TEMP_IV_MS   2000u
 #define DISK_IV_MS   10000u
 #define MI_MIN_GAP   NS_PER_SEC       /* rediscover mounts at most 1/s     */
@@ -32,7 +34,7 @@ static app_t A;
 
 static const unsigned STEPS[] = {100, 200, 250, 500, 1000, 2000, 3000, 5000, 10000, 30000, 60000};
 
-static unsigned gpu_iv(const app_t *a) { return a->interval_ms > GPU_IV_MS ? a->interval_ms : GPU_IV_MS; }
+static unsigned slow_iv(const app_t *a) { return a->interval_ms > SLOW_IV_MS ? a->interval_ms : SLOW_IV_MS; }
 static unsigned temp_iv(const app_t *a) { return a->interval_ms > TEMP_IV_MS ? a->interval_ms : TEMP_IV_MS; }
 static unsigned disk_iv(const app_t *a) { return a->interval_ms > DISK_IV_MS ? a->interval_ms : DISK_IV_MS; }
 
@@ -82,7 +84,26 @@ static void change_speed(app_t *a, int faster)
     a->interval_ms = nv;
 }
 
-enum { K_NONE, K_QUIT, K_SPEED, K_SAMPLE_TEMP, K_SAMPLE_NET };
+enum { K_NONE, K_QUIT, K_SPEED, K_SAMPLE_TEMP, K_SAMPLE_NET, K_VIEW };
+
+static int set_view(app_t *a, int v)
+{
+    a->view = a->view == v ? VIEW_MAIN : v;
+    a->scroll = 0;
+    return K_VIEW;
+}
+
+/* The info and battery views read their data only while open. */
+static void load_view(app_t *a)
+{
+    if (a->view == VIEW_INFO) {
+        if (!a->si.loaded)
+            sysinfo_load(&a->si);
+        sysinfo_ip(&a->si, a->net.sel);
+    }
+    if (a->view == VIEW_INFO || a->view == VIEW_BAT)
+        battery_scan(&a->bat);
+}
 
 static int handle_key(app_t *a, int c)
 {
@@ -95,8 +116,13 @@ static int handle_key(app_t *a, int c)
         hist_clear(&a->mem.hist);
         hist_clear(&a->net.hrx);
         hist_clear(&a->net.htx);
+        hist_clear(&a->dio.hist);
+        for (unsigned i = 0; i < a->gpu.n; i++)
+            hist_clear(&a->gpu.d[i].hist);
         break;
-    case 'h': case 'H': case '?': a->help = !a->help; a->scroll = 0; break;
+    case 'h': case 'H': case '?': return set_view(a, VIEW_HELP);
+    case 'i': case 'I': return set_view(a, VIEW_INFO);
+    case 'b': case 'B': return set_view(a, VIEW_BAT);
     case 'n': case 'N': net_cycle(&a->net); return K_SAMPLE_NET;
     case 'd': case 'D': a->disk_detail = !a->disk_detail; break;
     case 'c': case 'C': a->cores = !a->cores; break;
@@ -145,7 +171,8 @@ static int handle_input(app_t *a, int *hup)
                 else if (f == '~' && p == '6') a->scroll += page;
                 i = j;
             } else {
-                a->help = 0; /* lone Esc closes help */
+                a->view = VIEW_MAIN; /* lone Esc: back to the monitor */
+                a->scroll = 0;
             }
         } else {
             r = handle_key(a, b[i]);
@@ -174,6 +201,57 @@ static void print_stats(uint64_t frames, uint64_t start_ns)
             wall > 0 ? cpu * 100.0 / wall : 0.0, ru.ru_maxrss);
 }
 
+static void free_all(app_t *a)
+{
+    cpu_free(&a->cpu);
+    mem_free(&a->mem);
+    net_free(&a->net);
+    disk_free(&a->disk);
+    dio_free(&a->dio);
+    temp_free(&a->temp);
+    gpu_free(&a->gpu);
+}
+
+/* --once / --json: second sample one interval after the first (taken by the
+ * init functions), then print and exit.  Network filesystems answer during
+ * the wait or are reported as pending. */
+static int run_report(app_t *a)
+{
+    sigset_t all;
+    sigfillset(&all);
+    pthread_sigmask(SIG_UNBLOCK, &all, NULL); /* no terminal to restore: Ctrl-C may kill */
+    uint64_t end = mono_ns() + a->interval_ms * NS_PER_MS;
+    for (;;) {
+        uint64_t now = mono_ns();
+        if (now >= end)
+            break;
+        int ms = (int)((end - now + NS_PER_MS - 1) / NS_PER_MS);
+        if (a->disk.pipe_fd >= 0) {
+            struct pollfd pf = {a->disk.pipe_fd, POLLIN, 0};
+            if (poll(&pf, 1, ms) > 0)
+                disk_on_pipe(&a->disk);
+        } else {
+            struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
+            nanosleep(&ts, NULL);
+        }
+    }
+    cpu_sample(&a->cpu, 0);
+    mem_sample(&a->mem, 0);
+    net_sample(&a->net, 0);
+    dio_sample(&a->dio, 0);
+    cpu_freq_sample(&a->cpu);
+    if (a->gpu.n)
+        gpu_sample(&a->gpu, 0);
+    if (a->temps_on)
+        temp_sample(&a->temp, 0);
+    battery_scan(&a->bat);
+    if (a->cfg.json)
+        report_json(a, stdout);
+    else
+        report_text(a, stdout);
+    return fflush(stdout) == 0 && !ferror(stdout) ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
     config_t cfg;
@@ -191,16 +269,23 @@ int main(int argc, char **argv)
     default:
         break;
     }
-    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
-        fprintf(stderr, "dcmon: standard input and output must be a terminal\n");
+    if (!cfg.no_config && cli_config(&cfg, cfg.config, err, sizeof err) != 0) {
+        fprintf(stderr, "dcmon: %s\n", err);
+        return 2;
+    }
+    int report = cfg.once || cfg.json;
+    if (!report && (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))) {
+        fprintf(stderr, "dcmon: standard input and output must be a terminal "
+                        "(use --once or --json for a snapshot)\n");
         return 1;
     }
 
     app_t *a = &A;
     a->cfg = cfg;
     a->interval_ms = cfg.interval_ms;
-    a->cores = 1;
-    a->disk_detail = 1;
+    a->cores = cfg.ui_cores != 0;
+    a->disk_detail = cfg.ui_disk_details != 0;
+    a->temp_detail = cfg.ui_temp_details == 1;
     a->temps_on = !cfg.no_temps;
     a->utf8 = !cfg.ascii && detect_utf8();
     a->color_mode = detect_colors(&cfg);
@@ -225,8 +310,16 @@ int main(int argc, char **argv)
     disk_init(&a->disk, cfg.mounts, cfg.nmounts, cfg.all_mounts);
     if (a->temps_on)
         temp_init(&a->temp, cfg.temp_warn, cfg.temp_hot);
+    dio_init(&a->dio);
+    cpu_freq_sample(&a->cpu);
     if (!cfg.no_gpu)
-        a->gpu_on = gpu_init(&a->gpu, NULL) == 0;
+        a->gpu_on = gpu_init(&a->gpu, NULL) == 0 && cfg.ui_gpu != 0;
+
+    if (report) {
+        int rc = run_report(a);
+        free_all(a);
+        return rc;
+    }
 
     int sfd = signalfd(-1, &set, SFD_NONBLOCK | SFD_CLOEXEC);
     int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -245,7 +338,7 @@ int main(int argc, char **argv)
     uint64_t start = mono_ns(), now = start;
     uint64_t iv = a->interval_ms * NS_PER_MS;
     uint64_t t_fast = now + (iv < 250 * NS_PER_MS ? iv : 250 * NS_PER_MS); /* quick first sample */
-    uint64_t t_gpu = t_fast; /* first GPU sample together with the first fast tick */
+    uint64_t t_slow = t_fast; /* first GPU sample together with the first fast tick */
     uint64_t t_temp = now + temp_iv(a) * NS_PER_MS;
     uint64_t t_disk = now + disk_iv(a) * NS_PER_MS;
     uint64_t t_end = cfg.duration_s ? now + cfg.duration_s * NS_PER_SEC : UINT64_MAX;
@@ -261,13 +354,18 @@ int main(int argc, char **argv)
             cpu_sample(&a->cpu, 1);
             mem_sample(&a->mem, 1);
             net_sample(&a->net, 1);
+            dio_sample(&a->dio, 1);
             t_fast = advance(t_fast, iv, now);
             dirty = 1;
             slack = iv / 2;
         }
-        if (a->gpu_on && now + slack >= t_gpu) { /* hidden GPU section costs nothing */
-            gpu_sample(&a->gpu, 1);
-            t_gpu = advance(t_gpu, gpu_iv(a) * NS_PER_MS, now);
+        if (now + slack >= t_slow) {
+            if (a->gpu_on) /* hidden GPU section costs nothing */
+                gpu_sample(&a->gpu, 1);
+            cpu_freq_sample(&a->cpu); /* no syscalls where cpufreq is absent */
+            if (a->view == VIEW_INFO || a->view == VIEW_BAT)
+                battery_scan(&a->bat);
+            t_slow = advance(t_slow, slow_iv(a) * NS_PER_MS, now);
             dirty = 1;
         }
         if (a->temps_on && now + slack >= t_temp) {
@@ -297,7 +395,7 @@ int main(int argc, char **argv)
         }
 
         uint64_t dl = t_fast;
-        if (a->gpu_on && t_gpu < dl) dl = t_gpu;
+        if (t_slow < dl) dl = t_slow;
         if (a->temps_on && t_temp < dl) dl = t_temp;
         if (t_disk < dl) dl = t_disk;
         if (t_mi < dl) dl = t_mi;
@@ -369,6 +467,8 @@ int main(int argc, char **argv)
                     t_fast = now + iv;
             } else if (act == K_SAMPLE_TEMP && a->temps_on) {
                 temp_sample(&a->temp, a->temp_detail);
+            } else if (act == K_VIEW) {
+                load_view(a);
             }
             dirty = 1;
         }
@@ -390,12 +490,7 @@ int main(int argc, char **argv)
     term_close();
     if (cfg.stats)
         print_stats(frames, start);
-    cpu_free(&a->cpu);
-    mem_free(&a->mem);
-    net_free(&a->net);
-    disk_free(&a->disk);
-    temp_free(&a->temp);
-    gpu_free(&a->gpu);
+    free_all(a);
     render_free();
     close(sfd);
     close(tfd);

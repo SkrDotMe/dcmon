@@ -3,7 +3,9 @@
  * One poll() waits on: a signalfd (INT/TERM/HUP/QUIT/WINCH/TSTP/CONT),
  * stdin, a timerfd armed with an absolute CLOCK_MONOTONIC deadline, the
  * mountinfo fd (POLLPRI = mount table changed) and, while a network
- * filesystem probe runs, its result pipe.  Nothing busy-waits. */
+ * filesystem probe runs, its result pipe.  Nothing busy-waits.  While
+ * paused, no source is sampled and only the keyboard, signals and the
+ * status message timer wake the loop. */
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
@@ -18,6 +20,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "alert.h"
 #include "app.h"
 #include "renderer.h"
 #include "report.h"
@@ -29,6 +32,7 @@
 #define TEMP_IV_MS   2000u
 #define DISK_IV_MS   10000u
 #define MI_MIN_GAP   NS_PER_SEC       /* rediscover mounts at most 1/s     */
+#define MSG_NS       (3 * NS_PER_SEC) /* status message lifetime           */
 
 static app_t A;
 
@@ -62,11 +66,12 @@ static int detect_colors(const config_t *c)
 {
     const char *nc = getenv("NO_COLOR"), *t = getenv("TERM"), *ct = getenv("COLORTERM");
     if (c->no_colors || (nc && *nc) || !t || !strcmp(t, "dumb"))
-        return 0;
-    if ((ct && (strstr(ct, "truecolor") || strstr(ct, "24bit"))) || strstr(t, "256") ||
-        strstr(t, "direct"))
-        return 2;
-    return 1;
+        return CM_NONE;
+    if ((ct && (strstr(ct, "truecolor") || strstr(ct, "24bit"))) || strstr(t, "direct"))
+        return CM_TRUE;
+    if (strstr(t, "256"))
+        return CM_256;
+    return CM_16;
 }
 
 static void change_speed(app_t *a, int faster)
@@ -84,7 +89,32 @@ static void change_speed(app_t *a, int faster)
     a->interval_ms = nv;
 }
 
-enum { K_NONE, K_QUIT, K_SPEED, K_SAMPLE_TEMP, K_SAMPLE_NET, K_VIEW };
+enum { K_NONE, K_QUIT, K_SPEED, K_SAMPLE_TEMP, K_SAMPLE_NET, K_VIEW, K_PAUSE };
+
+static void set_msg(app_t *a, const char *s)
+{
+    snprintf(a->msg, sizeof a->msg, "%s", s);
+    a->msg_until = mono_ns() + MSG_NS;
+}
+
+/* Next or previous theme; the choice is written to the configuration file
+ * that was read at start-up (or the default one), so it is kept. */
+static void cycle_theme(app_t *a, int dir)
+{
+    int n = theme_count();
+    a->theme = (a->theme + dir + n) % n;
+    char m[80], err[256];
+    const char *name = theme_name(a->theme);
+    if (a->color_mode == CM_NONE)
+        snprintf(m, sizeof m, "theme %s (colors are off)", name);
+    else if (a->cfg.no_config)
+        snprintf(m, sizeof m, "theme %s (not saved: --no-config)", name);
+    else if (cli_config_save(a->cfg.config, "theme", name, err, sizeof err) == 0)
+        snprintf(m, sizeof m, "theme %s, saved", name);
+    else
+        snprintf(m, sizeof m, "theme %s (not saved: %.40s)", name, err);
+    set_msg(a, m);
+}
 
 static int set_view(app_t *a, int v)
 {
@@ -109,6 +139,9 @@ static int handle_key(app_t *a, int c)
 {
     switch (c) {
     case 'q': case 'Q': return K_QUIT;
+    case 'p': case 'P': case ' ': a->paused = !a->paused; return K_PAUSE;
+    case 's': cycle_theme(a, 1); break;
+    case 'S': cycle_theme(a, -1); break;
     case '+': case '=': change_speed(a, 1); return K_SPEED;
     case '-': case '_': change_speed(a, 0); return K_SPEED;
     case 'r': case 'R':
@@ -212,15 +245,9 @@ static void free_all(app_t *a)
     gpu_free(&a->gpu);
 }
 
-/* --once / --json: second sample one interval after the first (taken by the
- * init functions), then print and exit.  Network filesystems answer during
- * the wait or are reported as pending. */
-static int run_report(app_t *a)
+/* Sleep until end; network filesystem probes answer meanwhile. */
+static void wait_until(app_t *a, uint64_t end)
 {
-    sigset_t all;
-    sigfillset(&all);
-    pthread_sigmask(SIG_UNBLOCK, &all, NULL); /* no terminal to restore: Ctrl-C may kill */
-    uint64_t end = mono_ns() + a->interval_ms * NS_PER_MS;
     for (;;) {
         uint64_t now = mono_ns();
         if (now >= end)
@@ -235,6 +262,17 @@ static int run_report(app_t *a)
             nanosleep(&ts, NULL);
         }
     }
+}
+
+/* --once / --json: second sample one interval after the first (taken by the
+ * init functions), then print and exit.  Network filesystems answer during
+ * the wait or are reported as pending. */
+static int run_report(app_t *a)
+{
+    sigset_t all;
+    sigfillset(&all);
+    pthread_sigmask(SIG_UNBLOCK, &all, NULL); /* no terminal to restore: Ctrl-C may kill */
+    wait_until(a, mono_ns() + a->interval_ms * NS_PER_MS);
     cpu_sample(&a->cpu, 0);
     mem_sample(&a->mem, 0);
     net_sample(&a->net, 0);
@@ -250,6 +288,51 @@ static int run_report(app_t *a)
     else
         report_text(a, stdout);
     return fflush(stdout) == 0 && !ferror(stdout) ? 0 : 1;
+}
+
+/* --stream: one JSON object per line every interval (JSON Lines), with the
+ * same schedules as the monitor: GPU, CPU frequency and batteries at most
+ * once a second, temperatures every 2 s, filesystems every 10 s.  Ends on
+ * --count, --duration, a signal or when the reader goes away (EPIPE). */
+static int run_stream(app_t *a)
+{
+    sigset_t all;
+    sigfillset(&all);
+    pthread_sigmask(SIG_UNBLOCK, &all, NULL);
+    uint64_t iv = a->interval_ms * NS_PER_MS, now = mono_ns();
+    uint64_t next = now + iv, t_slow = 0, t_temp = 0, t_disk = now + disk_iv(a) * NS_PER_MS;
+    uint64_t t_end = a->cfg.duration_s ? now + a->cfg.duration_s * NS_PER_SEC : UINT64_MAX;
+    for (unsigned lines = 0;;) {
+        wait_until(a, next < t_end ? next : t_end);
+        now = mono_ns();
+        if (now >= t_end)
+            return 0;
+        cpu_sample(&a->cpu, 0);
+        mem_sample(&a->mem, 0);
+        net_sample(&a->net, 0);
+        dio_sample(&a->dio, 0);
+        if (now >= t_slow) {
+            cpu_freq_sample(&a->cpu);
+            if (a->gpu.n)
+                gpu_sample(&a->gpu, 0);
+            battery_scan(&a->bat);
+            t_slow = now + slow_iv(a) * NS_PER_MS - SLACK_NS;
+        }
+        if (a->temps_on && now >= t_temp) {
+            temp_sample(&a->temp, 0);
+            t_temp = now + temp_iv(a) * NS_PER_MS - SLACK_NS;
+        }
+        if (now >= t_disk) {
+            disk_sample(&a->disk);
+            t_disk = now + disk_iv(a) * NS_PER_MS - SLACK_NS;
+        }
+        report_json(a, stdout);
+        if (fflush(stdout) != 0 || ferror(stdout))
+            return errno == EPIPE ? 0 : 1;
+        if (a->cfg.count && ++lines >= a->cfg.count)
+            return 0;
+        next = advance(next, iv, mono_ns());
+    }
 }
 
 int main(int argc, char **argv)
@@ -273,7 +356,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "dcmon: %s\n", err);
         return 2;
     }
-    int report = cfg.once || cfg.json;
+    int report = cfg.once || cfg.json || cfg.stream;
     if (!report && (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))) {
         fprintf(stderr, "dcmon: standard input and output must be a terminal "
                         "(use --once or --json for a snapshot)\n");
@@ -289,6 +372,9 @@ int main(int argc, char **argv)
     a->temps_on = !cfg.no_temps;
     a->utf8 = !cfg.ascii && detect_utf8();
     a->color_mode = detect_colors(&cfg);
+    a->theme = cfg.theme >= 0 ? cfg.theme : 0;
+    if (a->cfg.alert < 0)
+        a->cfg.alert = AL_FLASH;
     if (gethostname(a->host, sizeof a->host - 1) != 0)
         a->host[0] = '\0';
 
@@ -316,7 +402,7 @@ int main(int argc, char **argv)
         a->gpu_on = gpu_init(&a->gpu, NULL) == 0 && cfg.ui_gpu != 0;
 
     if (report) {
-        int rc = run_report(a);
+        int rc = cfg.stream ? run_stream(a) : run_report(a);
         free_all(a);
         return rc;
     }
@@ -350,6 +436,13 @@ int main(int argc, char **argv)
         /* Slower sources due within half a refresh are sampled together with
          * the fast tick: one wake-up and one frame instead of two. */
         uint64_t slack = SLACK_NS;
+        int sampled = 0;
+        if (a->msg[0] && now + SLACK_NS >= a->msg_until) {
+            a->msg[0] = '\0';
+            dirty = 1;
+        }
+        if (a->paused)
+            goto idle;
         if (now + SLACK_NS >= t_fast) {
             cpu_sample(&a->cpu, 1);
             mem_sample(&a->mem, 1);
@@ -357,6 +450,7 @@ int main(int argc, char **argv)
             dio_sample(&a->dio, 1);
             t_fast = advance(t_fast, iv, now);
             dirty = 1;
+            sampled = 1;
             slack = iv / 2;
         }
         if (now + slack >= t_slow) {
@@ -384,6 +478,12 @@ int main(int argc, char **argv)
             t_disk = advance(t_disk, disk_iv(a) * NS_PER_MS, now);
             dirty = 1;
         }
+        if (sampled && a->cfg.alert != AL_OFF) {
+            unsigned risen = alert_eval(a);
+            if (risen && (a->cfg.alert & AL_BELL))
+                ob_str("\a"); /* sent with the next frame */
+        }
+    idle:
         if (now >= t_end)
             break;
         if (dirty) {
@@ -394,12 +494,15 @@ int main(int argc, char **argv)
                 break;
         }
 
-        uint64_t dl = t_fast;
-        if (t_slow < dl) dl = t_slow;
-        if (a->temps_on && t_temp < dl) dl = t_temp;
-        if (t_disk < dl) dl = t_disk;
-        if (t_mi < dl) dl = t_mi;
-        if (t_end < dl) dl = t_end;
+        uint64_t dl = t_end;
+        if (!a->paused) {
+            if (t_fast < dl) dl = t_fast;
+            if (t_slow < dl) dl = t_slow;
+            if (a->temps_on && t_temp < dl) dl = t_temp;
+            if (t_disk < dl) dl = t_disk;
+            if (t_mi < dl) dl = t_mi;
+        }
+        if (a->msg[0] && a->msg_until < dl) dl = a->msg_until;
         if (dl != armed) {
             struct itimerspec its;
             memset(&its, 0, sizeof its);
@@ -469,6 +572,14 @@ int main(int argc, char **argv)
                 temp_sample(&a->temp, a->temp_detail);
             } else if (act == K_VIEW) {
                 load_view(a);
+            } else if (act == K_PAUSE && !a->paused) {
+                /* resume: new baseline, so the first rates after the pause
+                 * do not average over it; the next tick a full interval on */
+                cpu_sample(&a->cpu, 0);
+                mem_sample(&a->mem, 0);
+                net_sample(&a->net, 0);
+                dio_sample(&a->dio, 0);
+                t_fast = mono_ns() + iv;
             }
             dirty = 1;
         }

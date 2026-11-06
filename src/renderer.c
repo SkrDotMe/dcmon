@@ -12,35 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "alert.h"
 #include "terminal.h"
+#include "theme.h"
 #include "util.h"
-
-/* ---- colours ---------------------------------------------------------- */
-
-enum { C_RESET, C_TEXT, C_DIM, C_BORDER, C_TITLE, C_BOLD, C_CPU, C_CPU_B, C_RAM, C_RAM_B,
-       C_DL, C_DL_B, C_UL, C_UL_B, C_DISK, C_DISK_B, C_GPU, C_GPU_B, C_GOOD, C_WARN, C_HOT,
-       C_EMPTY, C_COUNT };
-
-static const char *const SGR256[C_COUNT] = {
-    [C_RESET] = "\x1b[0m",          [C_TEXT] = "\x1b[0;38;5;252m",   [C_DIM] = "\x1b[0;38;5;245m",
-    [C_BORDER] = "\x1b[0;38;5;240m", [C_TITLE] = "\x1b[0;1;38;5;255m", [C_BOLD] = "\x1b[0;1;38;5;255m",
-    [C_CPU] = "\x1b[0;38;5;80m",     [C_CPU_B] = "\x1b[0;1;38;5;80m",  [C_RAM] = "\x1b[0;38;5;114m",
-    [C_RAM_B] = "\x1b[0;1;38;5;114m", [C_DL] = "\x1b[0;38;5;75m",      [C_DL_B] = "\x1b[0;1;38;5;75m",
-    [C_UL] = "\x1b[0;38;5;141m",     [C_UL_B] = "\x1b[0;1;38;5;141m",  [C_DISK] = "\x1b[0;38;5;221m",
-    [C_DISK_B] = "\x1b[0;1;38;5;221m", [C_GPU] = "\x1b[0;38;5;209m",   [C_GPU_B] = "\x1b[0;1;38;5;209m",
-    [C_GOOD] = "\x1b[0;38;5;114m",    [C_WARN] = "\x1b[0;38;5;221m",
-    [C_HOT] = "\x1b[0;1;38;5;203m",  [C_EMPTY] = "\x1b[0;38;5;238m",
-};
-static const char *const SGR16[C_COUNT] = {
-    [C_RESET] = "\x1b[0m",   [C_TEXT] = "\x1b[0;37m",   [C_DIM] = "\x1b[0;90m",
-    [C_BORDER] = "\x1b[0;90m", [C_TITLE] = "\x1b[0;1;97m", [C_BOLD] = "\x1b[0;1;97m",
-    [C_CPU] = "\x1b[0;36m",  [C_CPU_B] = "\x1b[0;1;36m", [C_RAM] = "\x1b[0;32m",
-    [C_RAM_B] = "\x1b[0;1;32m", [C_DL] = "\x1b[0;34m",   [C_DL_B] = "\x1b[0;1;34m",
-    [C_UL] = "\x1b[0;35m",   [C_UL_B] = "\x1b[0;1;35m", [C_DISK] = "\x1b[0;33m",
-    [C_DISK_B] = "\x1b[0;1;33m", [C_GPU] = "\x1b[0;91m", [C_GPU_B] = "\x1b[0;1;91m",
-    [C_GOOD] = "\x1b[0;32m", [C_WARN] = "\x1b[0;33m",
-    [C_HOT] = "\x1b[0;1;31m", [C_EMPTY] = "\x1b[0;90m",
-};
 
 /* ---- glyphs ----------------------------------------------------------- */
 
@@ -60,7 +35,7 @@ static const glyphs_t G_ASCII = {
     "#", ".", "-", "|", "+", "+", "+", "+", "+", "+", "", "v", "^", "~", "."};
 
 static const glyphs_t *G = &G_UTF8;
-static int g_cmode, g_utf8;
+static int g_cmode, g_utf8, g_theme;
 
 /* ---- line builder ----------------------------------------------------- */
 
@@ -82,7 +57,7 @@ static void lb_color(int c)
 {
     if (!g_cmode || c == L.color)
         return;
-    const char *s = g_cmode == 2 ? SGR256[c] : SGR16[c];
+    const char *s = theme_sgr(g_theme, g_cmode, c);
     lb_bytes(s, strlen(s));
     L.color = c;
 }
@@ -988,6 +963,8 @@ static void row_kv(const app_t *a, int idx, int w)
 static const char *const HELP_KEYS[][2] = {
     {"q", "quit"},
     {"+ / -", "faster / slower refresh"},
+    {"p / space", "pause / resume (sampling stops)"},
+    {"s / S", "next / previous color theme (saved)"},
     {"r", "reset graph history"},
     {"n", "next network interface"},
     {"d", "disk details on / off"},
@@ -1000,7 +977,7 @@ static const char *const HELP_KEYS[][2] = {
     {"h / Esc", "close this help (Esc: back from any view)"},
 };
 #define HELP_NKEYS ((int)(sizeof HELP_KEYS / sizeof HELP_KEYS[0]))
-#define HELP_ROWS  (HELP_NKEYS + 8)
+#define HELP_ROWS  (HELP_NKEYS + 9)
 
 static void row_help(const app_t *a, int i, int w)
 {
@@ -1058,10 +1035,20 @@ static void row_help(const app_t *a, int i, int w)
         break;
     case 4:
         k = "display";
-        snprintf(buf, sizeof buf, "%s, %s, %dx%d",
-                 a->color_mode == 2 ? "256 colors" : a->color_mode ? "16 colors" : "no colors",
-                 a->utf8 ? "UTF-8" : "ASCII", a->cols, a->rows);
+        snprintf(buf, sizeof buf, "%s, theme %s, %s, %dx%d",
+                 a->color_mode == CM_TRUE  ? "true color"
+                 : a->color_mode == CM_256 ? "256 colors"
+                 : a->color_mode == CM_16  ? "16 colors"
+                                           : "no colors",
+                 theme_name(a->theme), a->utf8 ? "UTF-8" : "ASCII", a->cols, a->rows);
         break;
+    case 5: {
+        static const char *const am[] = {"off", "flash", "bell", "flash and bell"};
+        k = "alerts";
+        snprintf(buf, sizeof buf, "%s; hot temperature, RAM >= %u%%, disk >= %u%%",
+                 am[a->cfg.alert & 3], ALERT_MEM_PM / 10, ALERT_DISK_PM / 10);
+        break;
+    }
     default:
         lb_pad(L.col + w);
         return;
@@ -1135,7 +1122,8 @@ static void fill(int to, int split, const char *sg)
 
 static void draw_top(const app_t *a, int W, int split)
 {
-    char r[96], h[80], up[32];
+    char r[112], h[80], up[32];
+    int rc = C_DIM;
     uint64_t u = uptime_s();
     if (u >= 86400)
         snprintf(up, sizeof up, "%llud %lluh", (unsigned long long)(u / 86400),
@@ -1146,7 +1134,16 @@ static void draw_top(const app_t *a, int W, int split)
     else
         snprintf(up, sizeof up, "%llum", (unsigned long long)(u / 60));
     static const char *const vname[] = {"", "help", "system info", "battery"};
-    if (a->view != VIEW_MAIN)
+    if (a->msg[0]) {
+        snprintf(r, sizeof r, " %s ", a->msg);
+        rc = C_BOLD;
+    } else if (a->paused) {
+        snprintf(r, sizeof r, " PAUSED  p: resume ");
+        rc = C_WARN;
+    } else if (a->alerts && (a->cfg.alert & AL_FLASH)) {
+        snprintf(r, sizeof r, " ! %s ", a->alert);
+        rc = a->blink ? C_ALERT : C_HOT;
+    } else if (a->view != VIEW_MAIN)
         snprintf(r, sizeof r, " %s ", vname[a->view]);
     else if (W >= 90 && a->cpu.tasks)
         snprintf(r, sizeof r, " up %s, %u tasks, %u ms ", up, a->cpu.tasks, a->interval_ms);
@@ -1154,7 +1151,10 @@ static void draw_top(const app_t *a, int W, int split)
         snprintf(r, sizeof r, " up %s, %u ms ", up, a->interval_ms);
     else
         snprintf(r, sizeof r, " %u ms ", a->interval_ms);
-    int rw = text_cols(r), end = W - 2 - rw;
+    int rw = text_cols(r);
+    if (rw > W - 12) /* keep the corner and " dcmon " */
+        rw = W - 12;
+    int end = W - 2 - rw;
     lb_color(C_BORDER);
     lb_glyph(G->tl);
     lb_glyph(G->h);
@@ -1170,7 +1170,10 @@ static void draw_top(const app_t *a, int W, int split)
     L.limit = save;
     lb_color(C_BORDER);
     fill(end, split, G->td);
-    lb_text(r, C_DIM);
+    L.limit = end + rw;
+    lb_text(r, rc);
+    L.limit = save;
+    lb_pad(end + rw);
     lb_color(C_BORDER);
     lb_glyph(G->h);
     lb_glyph(G->tr);
@@ -1179,11 +1182,11 @@ static void draw_top(const app_t *a, int W, int split)
 static void draw_bottom(const app_t *a, int W, int split)
 {
     static const char *const hints[][2] = {{"q", "quit"},  {"+/-", "speed"}, {"h", "help"},
-                                           {"i", "info"},  {"b", "battery"}, {"n", "net"},
-                                           {"c", "cores"}, {"d", "disks"},   {"t", "temp"},
-                                           {"g", "gpu"}};
+                                           {"p", "pause"}, {"s", "theme"},   {"i", "info"},
+                                           {"b", "battery"}, {"n", "net"},   {"c", "cores"},
+                                           {"d", "disks"}, {"t", "temp"},    {"g", "gpu"}};
     static const char *const vhints[][2] = {{"q", "quit"}, {"Esc", "back"}, {"i", "info"},
-                                            {"b", "battery"}, {"h", "help"}};
+                                            {"b", "battery"}, {"s", "theme"}, {"h", "help"}};
     const char *const(*hs)[2] = a->view == VIEW_MAIN ? hints : vhints;
     size_t nh = a->view == VIEW_MAIN ? ARRAY_LEN(hints) : ARRAY_LEN(vhints);
     char right[48] = "";
@@ -1277,6 +1280,9 @@ void render_frame(app_t *a)
         H = 500;
     G = a->utf8 ? &G_UTF8 : &G_ASCII;
     g_cmode = a->color_mode;
+    g_theme = a->theme;
+    if (a->alerts)
+        a->blink = !a->blink;
     g_utf8 = a->utf8;
     if (ensure(W, H) != 0)
         return;

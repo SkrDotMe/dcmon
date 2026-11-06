@@ -6,6 +6,7 @@
 #include "report.h"
 
 #include <string.h>
+#include <time.h>
 
 #include "app.h"
 
@@ -89,6 +90,9 @@ void report_json(const app_t *a, FILE *f)
     const cpu_t *c = &a->cpu;
     fprintf(f, "{\"version\":\"%s\",\"host\":", DCMON_VERSION);
     jstr(f, a->host);
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    fprintf(f, ",\"time\":%lld.%03ld", (long long)ts.tv_sec, ts.tv_nsec / 1000000L);
     fprintf(f, ",\"uptime_s\":%llu,\"tasks\":{\"total\":%u,\"running\":%u},", (unsigned long long)uptime_s(),
             c->tasks, c->running);
 

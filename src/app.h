@@ -12,6 +12,7 @@
 #include "network.h"
 #include "sysinfo.h"
 #include "temperature.h"
+#include "theme.h"
 
 enum { VIEW_MAIN, VIEW_HELP, VIEW_INFO, VIEW_BAT };
 
@@ -34,8 +35,15 @@ typedef struct app {
     int       view;      /* VIEW_*                                     */
     int       cores, temp_detail, disk_detail;
     int       scroll, scroll_max;
-    int       color_mode; /* 0 none, 1 16 colors, 2 256 colors */
+    int       color_mode; /* CM_* (theme.h) */
+    int       theme;      /* index into the theme table               */
     int       utf8;
+    int       paused;     /* sampling stopped, screen frozen          */
+    int       blink;      /* alert highlight phase, flips every frame */
+    unsigned  alerts;     /* ALERT_* bits active now                  */
+    char      alert[64];  /* text of the active alerts                */
+    char      msg[80];    /* short status message in the top border   */
+    uint64_t  msg_until;  /* CLOCK_MONOTONIC ns when msg disappears   */
     char      host[64];
 } app_t;
 

@@ -11,11 +11,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
+
+#include "theme.h"
 
 enum { O_INTERVAL, O_IFACE, O_MOUNT, O_ALL, O_NOCOL, O_NOTEMP, O_NOGPU, O_ASCII, O_TWARN,
        O_THOT, O_DURATION, O_STATS, O_ONCE, O_JSON, O_CONFIG, O_NOCONFIG, O_CORES, O_DDET,
-       O_TDET, O_GPUSEC, O_HELP, O_VERSION };
+       O_TDET, O_GPUSEC, O_THEME, O_ALERT, O_STREAM, O_COUNT, O_HELP, O_VERSION };
 
 enum { A_FLAG, A_VALUE, A_BOOL };       /* argument kind          */
 enum { W_CLI = 1, W_FILE = 2, W_BOTH = 3 }; /* where it is accepted */
@@ -36,6 +39,8 @@ static const struct {
     {"config", 0, O_CONFIG, A_VALUE, W_CLI},         {"no-config", 0, O_NOCONFIG, A_FLAG, W_CLI},
     {"cores", 0, O_CORES, A_BOOL, W_FILE},           {"disk-details", 0, O_DDET, A_BOOL, W_FILE},
     {"temp-details", 0, O_TDET, A_BOOL, W_FILE},     {"gpu-section", 0, O_GPUSEC, A_BOOL, W_FILE},
+    {"theme", 0, O_THEME, A_VALUE, W_BOTH},          {"alert", 0, O_ALERT, A_VALUE, W_BOTH},
+    {"stream", 0, O_STREAM, A_FLAG, W_CLI},          {"count", 0, O_COUNT, A_VALUE, W_CLI},
     {"help", 'h', O_HELP, A_FLAG, W_CLI},            {"version", 'V', O_VERSION, A_FLAG, W_CLI},
 };
 
@@ -59,8 +64,13 @@ const char *cli_usage(void)
            "      --temp-warn C        warm threshold in degrees Celsius (default: from sensor)\n"
            "      --temp-hot C         hot threshold in degrees Celsius (default: from sensor)\n"
            "      --ascii              ASCII-only drawing (auto when the locale is not UTF-8)\n"
+           "      --theme NAME         color theme: default, nord, gruvbox, dracula, solarized,\n"
+           "                           mono, light (the s key cycles and saves it)\n"
+           "      --alert MODE         threshold alerts: flash (default), bell, both or off\n"
            "      --once               print one plain-text snapshot and exit (no terminal needed)\n"
            "      --json               print one JSON snapshot and exit (no terminal needed)\n"
+           "      --stream             print one JSON line every interval until stopped\n"
+           "      --count N            with --stream: stop after N lines\n"
            "      --config FILE        read options from FILE instead of the default file\n"
            "      --no-config          ignore the configuration file\n"
            "      --duration SEC       exit automatically after SEC seconds (benchmarking)\n"
@@ -71,9 +81,10 @@ const char *cli_usage(void)
            "Configuration file: $XDG_CONFIG_HOME/dcmon/config (default ~/.config/dcmon/config),\n"
            "one option per line without dashes, e.g. 'interval = 500', 'no-gpu', 'cores = off'.\n"
            "\n"
-           "Keys: q quit, +/- faster/slower, r reset graphs, h help, i system info, b battery,\n"
-           "      n next interface, d disk details, c CPU cores, t temperature details,\n"
-           "      g GPU section, Esc back, arrows/PgUp/PgDn scroll\n";
+           "Keys: q quit, +/- faster/slower, p/space pause, s/S next/previous theme,\n"
+           "      r reset graphs, h help, i system info, b battery, n next interface,\n"
+           "      d disk details, c CPU cores, t temperature details, g GPU section,\n"
+           "      Esc back, arrows/PgUp/PgDn scroll\n";
 }
 
 static int num(const char *s, long lo, long hi, long *out)
@@ -158,6 +169,27 @@ static int apply(config_t *c, int id, int argk, const char *val, const char *sho
     case O_DDET:     c->ui_disk_details = b; break;
     case O_TDET:     c->ui_temp_details = b; break;
     case O_GPUSEC:   c->ui_gpu = b; break;
+    case O_STREAM:   c->stream = 1; break;
+    case O_THEME:
+        c->theme = theme_find(val);
+        if (c->theme < 0)
+            FAIL("unknown theme '%.40s' (available: %s)", val, theme_names());
+        break;
+    case O_ALERT: {
+        static const char *const names[] = {"off", "flash", "bell", "both"}; /* AL_* order */
+        c->alert = -1;
+        for (int i = 0; i < 4; i++)
+            if (!strcmp(val, names[i]))
+                c->alert = i;
+        if (c->alert < 0)
+            FAIL("invalid %s '%.40s' (use flash, bell, both or off)", shown, val);
+        break;
+    }
+    case O_COUNT:
+        if (num(val, 1, 1000000000, &v))
+            FAIL("invalid count '%.40s'", val);
+        c->count = (unsigned)v;
+        break;
     case O_TWARN:
         if (num(val, 1, 150, &raw_warn[src]))
             FAIL("invalid %s '%.40s' (allowed: 1-150)", shown, val);
@@ -203,6 +235,7 @@ int cli_parse(int argc, char **argv, config_t *c, char *err, size_t errcap)
     memset(c, 0, sizeof *c);
     c->interval_ms = 1000;
     c->ui_cores = c->ui_disk_details = c->ui_temp_details = c->ui_gpu = -1;
+    c->theme = c->alert = -1;
     raw_warn[0] = raw_hot[0] = 0;
     int help = 0, version = 0;
 
@@ -273,6 +306,14 @@ int cli_parse(int argc, char **argv, config_t *c, char *err, size_t errcap)
         snprintf(err, errcap, "--config and --no-config cannot be combined");
         return CLI_ERROR;
     }
+    if (c->stream && c->once) {
+        snprintf(err, errcap, "--stream and --once cannot be combined");
+        return CLI_ERROR;
+    }
+    if (c->count && !c->stream) {
+        snprintf(err, errcap, "--count needs --stream");
+        return CLI_ERROR;
+    }
     if (finish(c, raw_warn[0], raw_hot[0], SET(c, O_TWARN), SET(c, O_THOT), err, errcap) != 0) {
         /* keep the command line spelling in messages */
         if (!strncmp(err, "all-mounts", 10))
@@ -333,6 +374,7 @@ int cli_config(config_t *c, const char *path, char *err, size_t errcap)
     config_t f;
     memset(&f, 0, sizeof f);
     f.ui_cores = f.ui_disk_details = f.ui_temp_details = f.ui_gpu = -1;
+    f.theme = f.alert = -1;
     raw_warn[1] = raw_hot[1] = 0;
     unsigned lineno = 0;
     char msg[200];
@@ -382,6 +424,8 @@ int cli_config(config_t *c, const char *path, char *err, size_t errcap)
     TAKE(O_DDET, ui_disk_details);
     TAKE(O_TDET, ui_temp_details);
     TAKE(O_GPUSEC, ui_gpu);
+    TAKE(O_THEME, theme);
+    TAKE(O_ALERT, alert);
 #undef TAKE
     if (!SET(c, O_MOUNT) && !SET(c, O_ALL)) {
         c->all_mounts = f.all_mounts;
@@ -395,5 +439,129 @@ int cli_config(config_t *c, const char *path, char *err, size_t errcap)
     c->set |= f.set;
     if (finish(c, warn, hot, wset, hset, msg, sizeof msg) != 0)
         FAIL("%.200s: %s", path, msg);
+    return 0;
+}
+
+/* the key of an active configuration line, without dashes; length 0 otherwise */
+static size_t line_key(const char *s, size_t len, const char **key)
+{
+    size_t i = 0;
+    while (i < len && (s[i] == ' ' || s[i] == '\t'))
+        i++;
+    if (i < len && s[i] == '#')
+        return 0;
+    if (i + 1 < len && s[i] == '-' && s[i + 1] == '-')
+        i += 2;
+    size_t b = i;
+    while (i < len && s[i] != '=' && s[i] != ' ' && s[i] != '\t' && s[i] != '\r')
+        i++;
+    *key = s + b;
+    return i - b;
+}
+
+static int mkdirs(char *path) /* the parent directories of path */
+{
+    for (char *p = path + 1; *p; p++) {
+        if (*p != '/')
+            continue;
+        *p = '\0';
+        int r = mkdir(path, 0755);
+        *p = '/';
+        if (r != 0 && errno != EEXIST)
+            return -1;
+    }
+    return 0;
+}
+
+int cli_config_save(const char *path, const char *key, const char *value, char *err, size_t errcap)
+{
+    static char in[16384], out[16384 + 256];
+    char def[512], tmp[560];
+    if (!path) {
+        cli_config_path(def, sizeof def);
+        if (!def[0])
+            FAIL("no configuration file path (HOME is not set)");
+        path = def;
+    }
+    size_t n = 0;
+    mode_t mode = 0644;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) == 0)
+            mode = st.st_mode & 07777;
+        ssize_t r = read(fd, in, sizeof in);
+        close(fd);
+        if (r < 0)
+            FAIL("cannot read %.200s: %s", path, strerror(errno));
+        if ((size_t)r >= sizeof in)
+            FAIL("%.200s is too large", path);
+        n = (size_t)r;
+    } else if (errno != ENOENT) {
+        FAIL("cannot read %.200s: %s", path, strerror(errno));
+    }
+
+    /* the last active line with this key is the one that takes effect */
+    size_t klen = strlen(key), hit = (size_t)-1, hit_end = 0;
+    for (size_t p = 0; p < n;) {
+        const char *e = memchr(in + p, '\n', n - p);
+        size_t len = e ? (size_t)(e - (in + p)) : n - p;
+        const char *k = NULL;
+        size_t kl = line_key(in + p, len, &k);
+        if (kl == klen && !memcmp(k, key, klen)) {
+            hit = p;
+            hit_end = p + len;
+        }
+        p += len + (e != NULL);
+    }
+    char line[160];
+    int ll = snprintf(line, sizeof line, "%s = %s", key, value);
+    if (ll < 0 || (size_t)ll >= sizeof line)
+        FAIL("value too long");
+    size_t o;
+    if (hit != (size_t)-1) {
+        if (hit_end > hit && in[hit_end - 1] == '\r') /* keep CRLF files consistent */
+            hit_end--;
+        memcpy(out, in, hit);
+        o = hit;
+        memcpy(out + o, line, (size_t)ll);
+        o += (size_t)ll;
+        memcpy(out + o, in + hit_end, n - hit_end);
+        o += n - hit_end;
+    } else {
+        memcpy(out, in, n);
+        o = n;
+        if (o && out[o - 1] != '\n')
+            out[o++] = '\n';
+        memcpy(out + o, line, (size_t)ll);
+        o += (size_t)ll;
+        out[o++] = '\n';
+    }
+
+    snprintf(tmp, sizeof tmp, "%s", path);
+    if (mkdirs(tmp) != 0)
+        FAIL("cannot create the directory of %.200s: %s", path, strerror(errno));
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
+    if (fd < 0)
+        FAIL("cannot write %.200s: %s", tmp, strerror(errno));
+    size_t done = 0;
+    while (done < o) {
+        ssize_t w = write(fd, out + done, o - done);
+        if (w < 0 && errno == EINTR)
+            continue;
+        if (w <= 0) {
+            int e = w < 0 ? errno : EIO;
+            close(fd);
+            unlink(tmp);
+            FAIL("cannot write %.200s: %s", tmp, strerror(e));
+        }
+        done += (size_t)w;
+    }
+    if (close(fd) != 0 || rename(tmp, path) != 0) {
+        int e = errno;
+        unlink(tmp);
+        FAIL("cannot replace %.200s: %s", path, strerror(e));
+    }
     return 0;
 }

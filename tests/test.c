@@ -22,6 +22,7 @@
 #include <termios.h>
 #include <unistd.h>
 
+#include "alert.h"
 #include "app.h"
 #include "renderer.h"
 #include "report.h"
@@ -1095,6 +1096,43 @@ static void test_config(void)
     CHECK(cfgfile(&c, err, "all-mounts\nmount = /\n", NULL) == -1);
     CHECK(cfgfile(&c, err, "temp-warn = 90\ntemp-hot = 80\n", NULL) == -1);
     CHECK(cfgfile(&c, err, "--interval = 250\n", NULL) == 0 && c.interval_ms == 250);
+    CHECK(cfgfile(&c, err, "theme = dracula\nalert = bell\n", NULL) == 0);
+    CHECK(c.theme == theme_find("dracula") && c.alert == AL_BELL);
+    CHECK(cfgfile(&c, err, "theme = dracula\nalert = bell\n", "--theme", "mono", NULL) == 0);
+    CHECK(c.theme == theme_find("mono") && c.alert == AL_BELL);
+    CHECK(cfgfile(&c, err, "theme = sepia\n", NULL) == -1 && strstr(err, "config:1:"));
+    CHECK(cfgfile(&c, err, "stream\n", NULL) == -1); /* command line only */
+
+    /* saving one setting keeps everything else */
+    static char cb[4096];
+    char sp[600];
+    snprintf(sp, sizeof sp, "%s/new/sub/config", g_tmp);
+    CHECK(cli_config_save(sp, "theme", "nord", err, sizeof err) == 0);
+    CHECK(read_path(sp, cb, sizeof cb) > 0);
+    CHECK_STR(cb, "theme = nord\n");
+    fx_write("/save1", "# theme = old\ninterval = 500\ntheme = gruvbox\nno-gpu");
+    snprintf(sp, sizeof sp, "%s/save1", g_tmp);
+    chmod(sp, 0600);
+    CHECK(cli_config_save(sp, "theme", "mono", err, sizeof err) == 0);
+    read_path(sp, cb, sizeof cb);
+    CHECK_STR(cb, "# theme = old\ninterval = 500\ntheme = mono\nno-gpu");
+    struct stat st;
+    CHECK(stat(sp, &st) == 0 && (st.st_mode & 0777) == 0600);
+    fx_write("/save2", "interval = 500");
+    snprintf(sp, sizeof sp, "%s/save2", g_tmp);
+    CHECK(cli_config_save(sp, "theme", "light", err, sizeof err) == 0);
+    read_path(sp, cb, sizeof cb);
+    CHECK_STR(cb, "interval = 500\ntheme = light\n");
+    fx_write("/save3", "interval = 500\r\n--theme=nord\r\n");
+    snprintf(sp, sizeof sp, "%s/save3", g_tmp);
+    CHECK(cli_config_save(sp, "theme", "dracula", err, sizeof err) == 0);
+    read_path(sp, cb, sizeof cb);
+    CHECK_STR(cb, "interval = 500\r\ntheme = dracula\r\n");
+    char *av[] = {"dcmon", NULL};
+    cli_parse(1, av, &c, err, sizeof err);
+    CHECK(cli_config(&c, sp, err, sizeof err) == 0 && c.theme == theme_find("dracula"));
+    snprintf(sp, sizeof sp, "%s/save2/x", g_tmp); /* parent is a file */
+    CHECK(cli_config_save(sp, "theme", "nord", err, sizeof err) == -1 && strstr(err, "save2"));
 
     /* explicit file must exist; the default one may be missing */
     char p[600];
@@ -1109,6 +1147,10 @@ static void test_config(void)
     char *argv[] = {"dcmon", NULL};
     cli_parse(1, argv, &c, err, sizeof err);
     CHECK(cli_config(&c, NULL, err, sizeof err) == 0 && c.interval_ms == 3000);
+    CHECK(cli_config_save(NULL, "theme", "gruvbox", err, sizeof err) == 0); /* default file */
+    cli_parse(1, argv, &c, err, sizeof err);
+    CHECK(cli_config(&c, NULL, err, sizeof err) == 0 && c.interval_ms == 3000 &&
+          c.theme == theme_find("gruvbox"));
     unsetenv("XDG_CONFIG_HOME");
     setenv("HOME", "/nonexistent-home", 1);
     cli_config_path(p, sizeof p);
@@ -1177,6 +1219,18 @@ static void test_cli(void)
 
     CHECK(parse(&c, err, "--once", NULL) == CLI_RUN && c.once && !c.json);
     CHECK(parse(&c, err, "--json", "--no-config", NULL) == CLI_RUN && c.json && c.no_config);
+    CHECK(parse(&c, err, NULL) == CLI_RUN && c.theme == -1 && c.alert == -1 && !c.stream && !c.count);
+    CHECK(parse(&c, err, "--theme", "nord", NULL) == CLI_RUN && c.theme == theme_find("nord"));
+    CHECK(parse(&c, err, "--theme=light", NULL) == CLI_RUN && c.theme == theme_find("light"));
+    CHECK(parse(&c, err, "--theme", "neon", NULL) == CLI_ERROR && strstr(err, "available: default, nord"));
+    CHECK(parse(&c, err, "--alert", "off", NULL) == CLI_RUN && c.alert == AL_OFF);
+    CHECK(parse(&c, err, "--alert", "both", NULL) == CLI_RUN && c.alert == AL_BOTH);
+    CHECK(parse(&c, err, "--alert", "loud", NULL) == CLI_ERROR && strstr(err, "--alert"));
+    CHECK(parse(&c, err, "--stream", "--count", "5", NULL) == CLI_RUN && c.stream && c.count == 5);
+    CHECK(parse(&c, err, "--stream", "--json", NULL) == CLI_RUN && c.stream && c.json);
+    CHECK(parse(&c, err, "--count", "5", NULL) == CLI_ERROR && strstr(err, "needs --stream"));
+    CHECK(parse(&c, err, "--stream", "--count", "0", NULL) == CLI_ERROR);
+    CHECK(parse(&c, err, "--stream", "--once", NULL) == CLI_ERROR);
     CHECK(parse(&c, err, "--config", "/x/y", NULL) == CLI_RUN && !strcmp(c.config, "/x/y"));
     CHECK(parse(&c, err, "--config", "/x", "--no-config", NULL) == CLI_ERROR);
     CHECK(parse(&c, err, "--cores", NULL) == CLI_ERROR); /* configuration file only */
@@ -1506,6 +1560,25 @@ static void test_render(void)
         }
     }
 
+    /* every theme in every colour mode */
+    a->view = VIEW_MAIN;
+    a->utf8 = 1;
+    a->cols = 100;
+    a->rows = 30;
+    for (int t = 0; t < theme_count(); t++)
+        for (int m = CM_NONE; m <= CM_TRUE; m++) {
+            a->theme = t;
+            a->color_mode = m;
+            render_invalidate(1);
+            size_t n = capture(a);
+            int painted = 0;
+            CHECK(verify_rows(g_out, n, 100, 30, &painted) == 0 && painted == 30);
+            CHECK(m != CM_TRUE || strstr(g_out, "38;2;") != NULL);
+            CHECK(capture(a) == 0);
+        }
+    a->theme = 0;
+    a->color_mode = CM_256;
+
     /* scrolling: tiny terminal, many rows */
     a->view = VIEW_MAIN;
     a->utf8 = 1;
@@ -1615,6 +1688,171 @@ static void test_long_run(void)
     render_free();
 }
 
+
+/* ---- themes ---------------------------------------------------------------- */
+
+static void test_theme(void)
+{
+    CHECK(theme_count() == 7);
+    CHECK(theme_find("default") == 0 && theme_find("nord") > 0);
+    CHECK(theme_find("Nord") == -1 && theme_find("") == -1);
+    CHECK_STR(theme_name(theme_find("gruvbox")), "gruvbox");
+    CHECK_STR(theme_name(99), "default");
+    CHECK(strstr(theme_names(), "dracula, solarized, mono, light") != NULL);
+
+    /* the default theme keeps the 256-colour indices of version 1.1 */
+    static const struct { int slot; const char *sgr; } def256[] = {
+        {C_TEXT, "\x1b[0;38;5;252m"},   {C_DIM, "\x1b[0;38;5;245m"},     {C_BORDER, "\x1b[0;38;5;240m"},
+        {C_TITLE, "\x1b[0;1;38;5;255m"}, {C_BOLD, "\x1b[0;1;38;5;255m"}, {C_CPU, "\x1b[0;38;5;80m"},
+        {C_CPU_B, "\x1b[0;1;38;5;80m"}, {C_RAM, "\x1b[0;38;5;114m"},     {C_DL, "\x1b[0;38;5;75m"},
+        {C_UL, "\x1b[0;38;5;141m"},     {C_DISK, "\x1b[0;38;5;221m"},    {C_GPU_B, "\x1b[0;1;38;5;209m"},
+        {C_GOOD, "\x1b[0;38;5;114m"},   {C_WARN, "\x1b[0;38;5;221m"},    {C_HOT, "\x1b[0;1;38;5;203m"},
+        {C_EMPTY, "\x1b[0;38;5;238m"},  {C_RESET, "\x1b[0m"},
+    };
+    for (size_t i = 0; i < sizeof def256 / sizeof def256[0]; i++)
+        CHECK_STR(theme_sgr(0, CM_256, def256[i].slot), def256[i].sgr);
+    CHECK_STR(theme_sgr(0, CM_16, C_HOT), "\x1b[0;1;31m");
+    CHECK_STR(theme_sgr(0, CM_16, C_GPU), "\x1b[0;91m");
+    CHECK_STR(theme_sgr(0, CM_TRUE, C_TEXT), "\x1b[0;38;2;208;208;208m");
+    CHECK_STR(theme_sgr(theme_find("nord"), CM_TRUE, C_CPU_B), "\x1b[0;1;38;2;136;192;208m");
+    CHECK_STR(theme_sgr(theme_find("light"), CM_16, C_TEXT), "\x1b[0;39m");
+    CHECK_STR(theme_sgr(theme_find("mono"), CM_16, C_CPU), "\x1b[0;37m");
+    CHECK_STR(theme_sgr(0, CM_NONE, C_TEXT), "");
+    CHECK(strstr(theme_sgr(0, CM_256, C_ALERT), "[0;1;7;38;5;203m") != NULL);
+
+    /* every slot of every theme is a well-formed SGR sequence, and the
+     * 256-colour mode never uses the terminal-defined colours 0-15 */
+    int bad = 0;
+    for (int t = 0; t < theme_count(); t++)
+        for (int m = CM_16; m <= CM_TRUE; m++)
+            for (int c = 0; c < C_COUNT; c++) {
+                const char *x = theme_sgr(t, m, c);
+                size_t n = strlen(x);
+                if (n < 4 || x[0] != 0x1b || x[1] != '[' || x[n - 1] != 'm' ||
+                    strspn(x + 2, "0123456789;") != n - 3)
+                    bad++;
+                const char *e = strstr(x, "38;5;");
+                if (m == CM_256 && c != C_RESET && (!e || atoi(e + 5) < 16 || atoi(e + 5) > 255))
+                    bad++;
+            }
+    CHECK(bad == 0);
+    /* themes really differ */
+    char first[48];
+    snprintf(first, sizeof first, "%s", theme_sgr(1, CM_TRUE, C_CPU)); /* shared buffer */
+    CHECK(strcmp(first, theme_sgr(2, CM_TRUE, C_CPU)) != 0);
+}
+
+/* ---- alerts ---------------------------------------------------------------- */
+
+static void test_alert(void)
+{
+    app_t *a = &g_app;
+    setup_app(a);
+    temp_sample(&a->temp, 0);
+    a->cfg.alert = AL_FLASH;
+    a->temp.hot = 200000;
+    a->mem.ok = 1;
+    a->mem.pm = 500;
+    for (unsigned i = 0; i < a->disk.n; i++)
+        a->disk.d[i].pm = 100;
+    for (unsigned i = 0; i < a->gpu.n; i++) {
+        a->gpu.d[i].temp = 40000;
+        a->gpu.d[i].hot = 90000;
+    }
+    CHECK(alert_eval(a) == 0 && a->alerts == 0 && a->alert[0] == '\0');
+
+    a->mem.pm = 912;
+    CHECK(alert_eval(a) == ALERT_MEM);
+    CHECK_STR(a->alert, "RAM 91%");
+    CHECK(alert_eval(a) == 0 && a->alerts == ALERT_MEM); /* still on: no second bell */
+    a->mem.pm = 899;
+    CHECK(alert_eval(a) == 0 && a->alerts == 0);
+    CHECK(alert_eval(a) == 0);
+    a->mem.pm = 950;
+    CHECK(alert_eval(a) == ALERT_MEM); /* on again: rings again */
+
+    int32_t t;
+    CHECK(temp_value(&a->temp, &t));
+    a->temp.hot = t;
+    CHECK(a->gpu.n > 0);
+    a->gpu.d[0].has_temp = 1;
+    a->gpu.d[0].temp = 95000;
+    CHECK(alert_eval(a) == (ALERT_CPU_TEMP | ALERT_GPU_TEMP));
+    char want[32];
+    snprintf(want, sizeof want, "CPU %d\xc2\xb0" "C, GPU0 95", (int)(t / 1000));
+    CHECK(strncmp(a->alert, want, strlen(want)) == 0);
+    CHECK(strstr(a->alert, ", RAM 95%") != NULL);
+    a->utf8 = 0;
+    alert_eval(a);
+    CHECK(strstr(a->alert, "GPU0 95C") != NULL);
+    a->utf8 = 1;
+    a->gpu_on = 0; /* a hidden GPU is not sampled: no alert from it */
+    alert_eval(a);
+    CHECK(a->alerts == (ALERT_CPU_TEMP | ALERT_MEM));
+    a->temps_on = 0;
+    alert_eval(a);
+    CHECK(a->alerts == ALERT_MEM);
+
+    CHECK(a->disk.n > 0);
+    disk_t *d = &a->disk.d[0];
+    d->state = DS_OK;
+    d->hide = 0;
+    d->pm = 990;
+    CHECK(alert_eval(a) == ALERT_DISK);
+    snprintf(want, sizeof want, "%.24s 99%%", d->mnt);
+    CHECK(strstr(a->alert, want) != NULL);
+    d->state = DS_TIMEOUT; /* stale numbers do not alert */
+    alert_eval(a);
+    CHECK(a->alerts == ALERT_MEM);
+
+    /* many alerts: the text is cut, never overflows */
+    for (unsigned i = 0; i < a->disk.n; i++) {
+        a->disk.d[i].state = DS_OK;
+        a->disk.d[i].hide = 0;
+        a->disk.d[i].pm = 1000;
+    }
+    a->temps_on = 1;
+    a->gpu_on = 1;
+    alert_eval(a);
+    CHECK(strlen(a->alert) < sizeof a->alert);
+
+    /* the top border shows it, flashing between two highlights */
+    a->view = VIEW_MAIN;
+    a->color_mode = CM_256;
+    static const int w[] = {40, 80, 200};
+    for (size_t k = 0; k < 3; k++) {
+        a->cols = w[k];
+        a->rows = 20;
+        render_invalidate(1);
+        size_t n = capture(a);
+        int painted;
+        CHECK(verify_rows(g_out, n, a->cols, a->rows, &painted) == 0 && painted == a->rows);
+        CHECK(strstr(g_out, "! ") != NULL);
+        CHECK(capture(a) > 0); /* the next frame flips the highlight */
+    }
+    CHECK(strstr(g_out, "RAM 95%") != NULL);
+    a->cfg.alert = AL_BELL; /* bell only: no text */
+    render_invalidate(1);
+    capture(a);
+    CHECK(strstr(g_out, "RAM 95%") == NULL);
+
+    /* status message and pause have priority */
+    a->cfg.alert = AL_FLASH;
+    snprintf(a->msg, sizeof a->msg, "theme nord, saved");
+    render_invalidate(1);
+    capture(a);
+    CHECK(strstr(g_out, "theme nord, saved") && !strstr(g_out, "RAM 95%"));
+    a->msg[0] = '\0';
+    a->paused = 1;
+    render_invalidate(1);
+    capture(a);
+    CHECK(strstr(g_out, "PAUSED") != NULL);
+    a->paused = 0;
+    a->alerts = 0;
+    teardown_app(a);
+    render_free();
+}
+
 /* ---- the real binary in a pseudo terminal ---------------------------------- */
 
 static int run_in_pty(const char *bin, const char *keys, int sig, struct termios *before,
@@ -1644,7 +1882,7 @@ static int run_in_pty(const char *bin, const char *keys, int sig, struct termios
         setenv("ASAN_OPTIONS", "detect_leaks=1", 1);
         /* LSAN_OPTIONS (suppressions for NVIDIA's libraries) is inherited */
         char *argv[20] = {(char *)bin, "--duration", "20", "--no-config"};
-        int ac = 4;
+        int ac = extra && extra[0] && !strcmp(extra[0], "--config") ? 3 : 4;
         for (int i = 0; extra && extra[i] && ac < 19; i++)
             argv[ac++] = extra[i];
         argv[ac] = NULL;
@@ -1734,6 +1972,29 @@ static void test_terminal_restore(void)
         CHECK(strstr(out, "Sanitizer") == NULL); /* ASan / LeakSanitizer report */
         CHECK(strstr(out, "runtime error") == NULL);
     }
+    /* pause: the top border says so and --duration still ends the run */
+    char *exp[] = {"--duration", "4", NULL};
+    int sp = run_in_pty(g_bin, "p", 0, &before, &after, out, sizeof out, exp);
+    CHECK(sp >= 0 && WIFEXITED(sp) && WEXITSTATUS(sp) == 0);
+    CHECK(strstr(out, "PAUSED") != NULL);
+    CHECK(termios_same(&before, &after));
+    /* themes: with --no-config the choice is not saved ... */
+    sp = run_in_pty(g_bin, "sS s", 0, &before, &after, out, sizeof out, exp);
+    CHECK(sp >= 0 && WIFEXITED(sp) && WEXITSTATUS(sp) == 0);
+    CHECK(strstr(out, "theme nord (not saved: --no-config)") != NULL);
+    /* ... and with a configuration file it is written there */
+    char cf[512], cb[512];
+    snprintf(cf, sizeof cf, "%s/pty.conf", g_tmp);
+    FILE *f = fopen(cf, "w");
+    fputs("# my settings\ninterval = 500\n", f);
+    fclose(f);
+    char *exc[] = {"--config", cf, "--duration", "4", NULL};
+    sp = run_in_pty(g_bin, "ss", 0, &before, &after, out, sizeof out, exc);
+    CHECK(sp >= 0 && WIFEXITED(sp) && WEXITSTATUS(sp) == 0);
+    CHECK(strstr(out, "theme gruvbox, saved") != NULL);
+    CHECK(read_path(cf, cb, sizeof cb) > 0);
+    CHECK_STR(cb, "# my settings\ninterval = 500\ntheme = gruvbox\n");
+
     /* --duration exits on its own; --stats prints a summary */
     char *ex[] = {"--interval", "100", "--duration", "2", "--stats", "--no-colors", NULL};
     int st = run_in_pty(g_bin, NULL, 0, &before, &after, out, sizeof out, ex);
@@ -1801,6 +2062,61 @@ static void test_binary_cli(void)
             CHECK(strncmp(out, "dcmon ", 6) == 0 && strstr(out, "\nCPU "));
     }
 
+    /* --stream: one valid JSON object per line; --count ends it */
+    {
+        int pfd[2];
+        if (pipe(pfd) != 0)
+            return;
+        p = fork();
+        if (p == 0) {
+            int dn = open("/dev/null", O_RDWR);
+            dup2(dn, 0);
+            dup2(pfd[1], 1);
+            close(pfd[0]);
+            execl(g_bin, g_bin, "--stream", "--count", "3", "--no-config", "--no-gpu", "--interval", "100",
+                  (char *)NULL);
+            _exit(127);
+        }
+        close(pfd[1]);
+        static char out[1 << 17];
+        size_t len = 0;
+        ssize_t r;
+        while ((r = read(pfd[0], out + len, sizeof out - 1 - len)) > 0)
+            len += (size_t)r;
+        out[len] = '\0';
+        close(pfd[0]);
+        waitpid(p, &st, 0);
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        int lines = 0, good = 0;
+        for (char *ln = out, *nl; (nl = strchr(ln, '\n')) != NULL; ln = nl + 1) {
+            *nl = '\0';
+            lines++;
+            good += json_ok(ln) && strstr(ln, "\"time\":") != NULL;
+        }
+        CHECK(lines == 3 && good == 3);
+
+        /* the reader going away ends the stream cleanly */
+        if (pipe(pfd) != 0)
+            return;
+        p = fork();
+        if (p == 0) {
+            int dn = open("/dev/null", O_RDWR);
+            dup2(dn, 0);
+            dup2(dn, 2);
+            dup2(pfd[1], 1);
+            close(pfd[0]);
+            execl(g_bin, g_bin, "--stream", "--no-config", "--no-gpu", "--interval", "100", (char *)NULL);
+            _exit(127);
+        }
+        close(pfd[1]);
+        char c1;
+        while (read(pfd[0], &c1, 1) == 1 && c1 != '\n')
+            ;
+        close(pfd[0]);
+        waitpid(p, &st, 0);
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    }
+
     /* a broken configuration file is reported with exit code 2 */
     char cf[512];
     snprintf(cf, sizeof cf, "%s/bad.conf", g_tmp);
@@ -1849,7 +2165,9 @@ int main(int argc, char **argv)
     RUN(test_sysinfo);
     RUN(test_cli);
     RUN(test_config);
+    RUN(test_theme);
     RUN(test_render);
+    RUN(test_alert);
     RUN(test_report);
     RUN(test_eintr);
     RUN(test_long_run);

@@ -6,7 +6,9 @@ It shows CPU usage and frequency per core, CPU temperature, RAM, GPU
 bars and scrolling Unicode graphs. Two extra views show a summary of the
 machine (`i`, like fastfetch) and everything the kernel reports about the
 batteries (`b`). `--once` and `--json` print a single snapshot for scripts
-and status bars. It is built to run all day over SSH with almost no CPU,
+and status bars, and `--stream` prints one JSON line per refresh. Seven colour
+themes can be switched with one key, and alerts flag hot sensors and full
+memory or disks. It is built to run all day over SSH with almost no CPU,
 memory or bandwidth.
 
 Example layout (illustrative values, shortened):
@@ -65,12 +67,15 @@ dcmon --interface enp3s0      # pin a network interface
 dcmon --mount / --mount /home # only these filesystems
 dcmon --all-mounts            # everything, including virtual filesystems
 dcmon --no-colors             # monochrome (NO_COLOR is honoured as well)
+dcmon --theme nord            # colour theme (the s key cycles and saves it)
+dcmon --alert both            # alerts: flash (default), bell, both or off
 dcmon --no-temperatures       # skip sensor discovery
 dcmon --no-gpu                # do not load NVML or scan for GPUs
 dcmon --temp-warn 70 --temp-hot 85
 dcmon --ascii                 # plain ASCII drawing
 dcmon --once                  # one plain-text snapshot, then exit
 dcmon --json                  # one JSON snapshot, then exit
+dcmon --stream                # one JSON line per interval (--count N to stop)
 dcmon --config ~/dcmon.conf   # another configuration file (--no-config: none)
 dcmon --duration 60 --stats   # exit after 60 s and print resource usage
 dcmon --help | --version
@@ -93,6 +98,8 @@ mount = /
 mount = "/mnt/my data"
 no-gpu                 # same as "no-gpu = yes"
 temp-hot = 90
+theme = gruvbox        # written by the s key
+alert = flash
 
 # start-up state of the toggles (yes/no, on/off, true/false, 1/0)
 cores = off
@@ -107,11 +114,18 @@ gpu-section = on
   one source.
 * **Errors** name the file and the line, for example
   `dcmon: /home/me/.config/dcmon/config:3: unknown option 'colour'`.
-* `once`, `json`, `duration`, `stats`, `config` and `help` are command-line
-  only. `cores`, `disk-details`, `temp-details` and `gpu-section` are
+* `once`, `json`, `stream`, `count`, `duration`, `stats`, `config` and
+  `help` are command-line only. `cores`, `disk-details`, `temp-details` and `gpu-section` are
   file-only (the keys `c`, `d`, `t` and `g` change them while running).
 * `--config FILE` reads another file, which must exist. `--no-config`
   ignores the file.
+* **Saving:** the `s` key writes `theme = NAME` to the file that was read
+  (the default file, or the `--config` file). Only that line changes; it
+  is added when missing, and the file and its directory are created when
+  needed. Comments, order and the other options stay as they are. The file
+  is replaced atomically through a temporary file. With `--no-config`
+  nothing is written. A `--theme` on the command line still wins at the
+  next start.
 
 ### Snapshots: `--once` and `--json`
 
@@ -131,14 +145,80 @@ percentages have one decimal and temperatures are degrees Celsius. A value
 that is not available is `null`. Top-level keys: `version`, `host`,
 `uptime_s`, `tasks`, `cpu` (usage, load, threads, frequency, temperature,
 per-core list), `memory`, `gpus`, `network`, `disk_io` (total and per disk),
-`filesystems`, `batteries` and `ac_online`. Network filesystems that do not
-answer within the interval are reported with `"error": "pending"`.
+`filesystems`, `batteries` and `ac_online`, plus `time` (Unix time with
+milliseconds). Network filesystems that do not answer within the interval
+are reported with `"error": "pending"`.
+
+### Streaming: `--stream`
+
+`--stream` prints the same JSON object once per refresh interval, one per
+line ([JSON Lines](https://jsonlines.org/)), until it is interrupted,
+`--count N` lines have been printed, `--duration SEC` has passed or the
+reader closes the pipe (then it exits with status 0). Each source keeps the
+schedule it has in the monitor: CPU, memory, network and disk I/O every
+interval, GPU, CPU frequency and batteries at most once a second,
+temperatures every 2 s and filesystems every 10 s.
+
+```bash
+dcmon --stream --interval 5000 >> /var/tmp/dcmon.jsonl     # simple logging
+dcmon --stream | jq -c '{t: .time, cpu: .cpu.usage_pct}'
+dcmon --stream --count 60 --no-gpu | jq -s 'map(.cpu.usage_pct) | max'
+```
+
+### Themes
+
+| Theme | Look |
+|---|---|
+| `default` | the original dcmon colours |
+| `nord` | cool blue and grey ([Nord](https://www.nordtheme.com/) palette) |
+| `gruvbox` | warm, retro ([gruvbox](https://github.com/morhetz/gruvbox) dark) |
+| `dracula` | purple, pink and cyan ([Dracula](https://draculatheme.com/)) |
+| `solarized` | [Solarized](https://ethanschoonover.com/solarized/) dark accents |
+| `mono` | greys only; levels are told apart by brightness and bold |
+| `light` | darker colours for terminals with a light background |
+
+`s` switches to the next theme and `S` to the previous one. The choice is
+shown for 3 s in the top border and saved to the configuration file.
+`--theme NAME` or `theme = NAME` selects one at start-up.
+
+A theme is a set of RGB colours. Terminals that announce true colour
+(`COLORTERM=truecolor` or `24bit`) get them exactly; 256-colour terminals
+get the nearest colour of the 6×6×6 cube or the grey ramp (never the 16
+basic colours, which terminals redefine). 16-colour terminals keep their
+own palette, so there the themes only differ for `mono` and `light`.
+`NO_COLOR`, `TERM=dumb` and `--no-colors` turn colours off altogether.
+
+### Pause
+
+`p` or the space bar freezes the screen so the numbers can be read in
+peace. While paused nothing is sampled at all: no `/proc` reads, no GPU
+queries, no timers apart from `--duration`. The top border shows
+`PAUSED`. Views, scrolling and themes still work. On resume the counters
+get a new baseline, so the next rates are measured over one normal
+interval, not averaged over the pause.
+
+### Alerts
+
+An alert is active while
+
+* the CPU temperature is at or above its hot threshold,
+* a visible GPU is at or above its hot temperature,
+* memory use is at or above 90 %, or
+* a shown filesystem is at or above 95 % full.
+
+With `alert = flash` (the default) the top border lists the active alerts,
+for example `! CPU 96°C, RAM 92%`, and its highlight alternates with every
+frame. `bell` rings the terminal bell once when an alert starts (not again
+while it lasts), `both` does both, `off` disables the check. The check
+uses the values already sampled for the screen and reads nothing extra.
 
 ### Keys
 
 | Key | Action |
 |---|---|
 | `q` | quit (Ctrl-C works too) |
+| `p` / space | pause / resume |
+| `s` / `S` | next / previous colour theme (saved to the configuration file) |
 | `+` / `-` | faster / slower refresh (100, 200, 250, 500 ms, 1, 2, 3, 5, 10, 30, 60 s) |
 | `r` | clear the graph history |
 | `h` / `?` | help screen (also shows sensor, interface and display information) |
@@ -391,8 +471,9 @@ once per second.
 Every frame writes a row exactly `cols` cells wide. Unicode is used for
 glyphs and assumed one column wide. Wide characters in mount names are
 counted as two. When the locale is not UTF-8, ASCII glyphs are used
-automatically. Colour mode is chosen from `COLORTERM`/`TERM`: 256 colours,
-16 colours, or none.
+automatically. Colour mode is chosen from `COLORTERM`/`TERM`: true colour,
+256 colours, 16 colours, or none. The escape sequences of the active theme
+are built once when the theme or mode changes.
 
 **Layout:**
 
@@ -427,7 +508,7 @@ automatically. Colour mode is chosen from `COLORTERM`/`TERM`: 256 colours,
 make test
 ```
 
-`tests/test.c` contains 763 checks and runs under AddressSanitizer,
+`tests/test.c` contains 957 checks and runs under AddressSanitizer,
 LeakSanitizer and UndefinedBehaviorSanitizer. Each module reads a fixture
 tree of `/proc` and `/sys` files generated in a temporary directory, so
 results do not depend on the host. The suite covers:
@@ -490,7 +571,18 @@ NVIDIA's own libraries leak a few hundred bytes once inside
 so dcmon's own code stays fully leak-checked.
 * Exit codes for invalid arguments, a broken configuration file and a
   non-terminal stdout; `--json` and `--once` from the real binary without a
-  terminal.
+  terminal; `--stream` with `--count` (every line valid JSON) and with the
+  reader closing the pipe.
+* Themes: the default theme keeps the exact 1.1 colours, every slot of
+  every theme is a well-formed escape sequence in every colour mode, the
+  256-colour mapping avoids colours 0-15, and every theme renders cleanly.
+* Saving the configuration: a new file in a missing directory, comments
+  and other lines kept, a missing final newline, CRLF files, file mode kept.
+* Alerts: each condition, the bell only on a new alert, hidden GPUs and
+  stale filesystems ignored, text cut safely, the flashing top border, and
+  the priority of status messages and pause.
+* In the pseudo terminal: pause, theme switching with `--no-config` (not
+  saved) and with a configuration file (saved, other lines unchanged).
 
 ## Benchmarking
 
@@ -572,9 +664,10 @@ Linux driver uses a different path, so measure it with
 If you don't need the GPU, run `--no-gpu`. The library is then not loaded
 at all. The `g` key only stops the queries; the library stays loaded.
 
-**Executable:** 100,480 bytes stripped (text 89,628, data 3,844); 1.0 was
-67,712 bytes. Most of the growth is the system information and battery
-views, the snapshot output and the configuration file parser. The only
+**Executable:** 108,680 bytes stripped (text 95,937, data 4,556); 1.1 was
+100,480 and 1.0 67,712 bytes. Most of the growth since 1.0 is the system
+information and battery views, the snapshot output, the configuration file
+parser and the themes. The only
 dynamic dependency is libc; NVML is loaded with `dlopen()` only when
 present. Without the GPU, most of the ~3.6 MiB peak RSS is glibc and the
 dynamic loader. dcmon's own heap use is a few tens of KiB: the `/proc` read
@@ -617,7 +710,9 @@ src/disk.c          mountinfo, statvfs, async probe for network/FUSE mounts
 src/diskio.c        /proc/diskstats: whole-disk read/write rates and busy time
 src/battery.c       /sys/class/power_supply: batteries and AC adapters
 src/sysinfo.c       static machine facts; rows of the info and battery views
-src/report.c        --once (plain text) and --json snapshots
+src/report.c        --once (plain text), --json and --stream output
+src/theme.c         colour themes and their escape sequences
+src/alert.c         threshold alerts
 src/temperature.c   hwmon / thermal-zone discovery and reading
 src/gpu.c           NVIDIA via NVML (dlopen), AMD via amdgpu sysfs
 src/histogram.c     ring buffers and scaling

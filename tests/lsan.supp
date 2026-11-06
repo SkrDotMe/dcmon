@@ -1,0 +1,7 @@
+# LeakSanitizer suppressions for the test-suite.
+# NVIDIA's driver libraries allocate a few hundred bytes once (pthread_once
+# in loadNVMLLibrary / cuGetExportTable) and never free them, even after
+# nvmlShutdown().  These are not dcmon allocations; dcmon's own code is
+# still fully leak-checked.
+leak:libnvidia-ml.so
+leak:libcuda.so

@@ -1,8 +1,9 @@
 # dcmon
 
 A very small, fast terminal system monitor for Linux, written in pure C17.
-It shows CPU usage per core, CPU temperature, RAM, network throughput and
-disk space, with coloured bars and scrolling Unicode graphs. It is built to
+It shows CPU usage per core, CPU temperature, RAM, GPU (NVIDIA and AMD),
+network throughput and disk space, with coloured bars and scrolling Unicode
+graphs. It is built to
 run all day over SSH with almost no CPU, memory or bandwidth.
 
 Example layout (illustrative values, shortened):
@@ -15,20 +16,25 @@ Example layout (illustrative values, shortened):
 │  0 ░░░░░░░░░░   0%   1 ██████████ 100%   2 ▏░░░░░░░░░   2%   3 ░░░░░░░░░░   0% │
 │ RAM                         avail 22.2 GiB  661 MiB / 22.9 GiB         2.8% │
 │ ██▋░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
+│ GPU  NVIDIA GeForce RTX 3060 Ti      210 MHz  fan 31%  21 / 176 W  37.0°C  0.0% │
+│ VRAM ███████▌░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  1.34 GiB / 8.00 GiB │
 │ NETWORK  eth0  up  10 Gb/s                                   default route │
 │ ↓ DOWNLOAD                                      scale 2.00 MiB/s  1.21 MiB/s │
 │ ↑ UPLOAD                                        scale 10.0 KiB/s  3.40 KiB/s │
 │ DISK USAGE                                                 3 filesystems │
 │ /  ext4                       free 949 GiB  6.44 GiB / 1006 GiB          1% │
 │ ▋░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
-└─ q quit +/- speed h help n net c cores d disks t temp ───────────────────────┘
+└─ q quit +/- speed h help n net c cores d disks t temp g gpu ─────────────────┘
 ```
 
 * **No dependencies:** only libc, `/proc`, `/sys` and system calls. No
   ncurses, no libsensors, and no helper processes (`top`, `df`, `ip`,
-  `sensors`, …).
-* **Small:** the stripped release binary is about 62 KiB (x86-64, gcc 15).
-  Its only shared library is libc.
+  `sensors`, `nvidia-smi`, …). NVIDIA's NVML library is loaded at run time
+  only when it is installed. It is not needed to build or run dcmon.
+* **Small:** the stripped release binary is about 66 KiB (x86-64, gcc 15).
+  Its only shared library is libc. Without the GPU section, peak memory is
+  about 3.6 MiB. Loading NVIDIA's NVML raises it to about 27 MiB; see the
+  benchmark section.
 * **Single-threaded event loop:** it sleeps on an absolute-deadline
   `timerfd` and never busy-waits.
 * **No root needed.**
@@ -55,6 +61,7 @@ dcmon --mount / --mount /home # only these filesystems
 dcmon --all-mounts            # everything, including virtual filesystems
 dcmon --no-colors             # monochrome (NO_COLOR is honoured as well)
 dcmon --no-temperatures       # skip sensor discovery
+dcmon --no-gpu                # do not load NVML or scan for GPUs
 dcmon --temp-warn 70 --temp-hot 85
 dcmon --ascii                 # plain ASCII drawing
 dcmon --duration 60 --stats   # exit after 60 s and print resource usage
@@ -75,6 +82,7 @@ Bad arguments print a clear message and exit with status 2.
 | `d` | detailed disk view (bar + free space) on/off |
 | `c` | per-core CPU grid on/off |
 | `t` | temperature details (package, hottest core, sensor driver) |
+| `g` | GPU section on/off. While hidden, the GPU is not queried at all. |
 | `↑` `↓` `PgUp` `PgDn` `j` `k` | scroll when the window is too small |
 
 Ctrl-Z suspends dcmon and restores the terminal. `fg` resumes it.
@@ -89,6 +97,51 @@ Ctrl-Z suspends dcmon and restores the terminal. `fg` resumes it.
 | RAM | `/proc/meminfo` | used = MemTotal − MemAvailable, so page cache counts as available. Kernels without `MemAvailable` use Free+Buffers+Cached+SReclaimable. Swap is shown when present. |
 | Network | `/proc/net/dev`, `/proc/net/route`, `/proc/net/ipv6_route`, `/sys/class/net/<if>/{operstate,speed}` | One read of `/proc/net/dev` gives the counters for every interface. |
 | Disk | `/proc/self/mountinfo` + `statvfs()` | Capacity only. Read/write throughput is not measured. |
+| GPU (NVIDIA) | NVML, `libnvidia-ml.so.1`, loaded with `dlopen()` | Utilisation, VRAM, temperature, power and limit, fan, graphics clock. |
+| GPU (AMD) | `/sys/class/drm/cardN/device/` (amdgpu) | Utilisation, VRAM, temperature, power and cap. |
+
+### GPU
+
+**NVIDIA (GeForce, RTX, Quadro, data-centre cards):** the proprietary
+driver publishes no utilisation or VRAM data in sysfs. The supported
+interface is NVML, the library that ships with the driver (and with WSL2,
+in `/usr/lib/wsl/lib`). `nvidia-smi` itself is only a front end for NVML.
+
+How dcmon uses NVML:
+
+* **Loading:** it calls `dlopen("libnvidia-ml.so.1")` at startup. It needs
+  no NVIDIA header and has no link-time dependency. dcmon declares the dozen
+  entry points it uses itself. If the library or driver is missing, the GPU
+  section is simply not shown.
+* **Missing values:** each query is optional. A value the GPU does not
+  report (`NOT_SUPPORTED`, for example the fan on many laptops) is hidden
+  instead of shown as zero.
+* **VRAM:** read with `nvmlDeviceGetMemoryInfo_v2`, which excludes the
+  memory the driver reserves for itself. This matches `nvidia-smi`. The old
+  v1 call counted about 160 MiB of that reservation as "used" on the test
+  card. Older drivers fall back to v1.
+* **Temperature colours:** they come from the card's own slowdown threshold
+  (warm = slowdown − 20 °C, hot = slowdown − 10 °C). Without it, the
+  defaults are 75 and 85 °C.
+* **Threads:** NVML starts a worker thread. dcmon blocks its signals
+  *before* any initialisation, so Ctrl-C or SIGTERM can never land in that
+  thread and kill dcmon without restoring the terminal. The terminal tests
+  caught this bug while the GPU support was being written.
+
+**AMD (amdgpu):** dcmon reads `gpu_busy_percent`, `mem_info_vram_used`,
+`mem_info_vram_total` and the card's hwmon `temp1_input`,
+`power1_average`/`power1_input` and `power1_cap`. These files are kept open
+and read with `pread()`. Connector entries (`card0-DP-1`) and non-AMD cards
+are skipped.
+
+**Intel iGPUs** are not shown, because i915/xe have no simple utilisation
+file.
+
+GPUs are sampled at most once per second: every `max(interval, 1000 ms)`.
+Each NVML query costs ioctls, so a shorter interval speeds up CPU, RAM and
+network but not the GPU. One graph column is therefore one GPU sample, which
+can span more time than a column of the CPU graph. Up to 8 GPUs are supported, and each gets a header line, a utilisation bar,
+a history graph and a VRAM bar.
 
 ### Temperature detection
 
@@ -245,7 +298,7 @@ automatically. Colour mode is chosen from `COLORTERM`/`TERM`: 256 colours,
 make test
 ```
 
-`tests/test.c` contains 587 checks and runs under AddressSanitizer,
+`tests/test.c` contains 624 checks and runs under AddressSanitizer,
 LeakSanitizer and UndefinedBehaviorSanitizer. Each module reads a fixture
 tree of `/proc` and `/sys` files generated in a temporary directory, so
 results do not depend on the host. The suite covers:
@@ -262,6 +315,15 @@ results do not depend on the host. The suite covers:
   the asynchronous probe through fork and pipe.
 * Temperature: Intel and AMD sensor choice, ignoring non-CPU sensors,
   thermal-zone fallback, threshold choice, malformed and missing sensors.
+* GPU, NVIDIA: tested against `tests/fake_nvml.c`, a stand-in
+  `libnvidia-ml.so` with two GPUs. One supports every query; the other
+  returns `NOT_SUPPORTED` for most. The tests cover:
+  * the library missing, and `nvmlInit` failing;
+  * preferring the `_v2` memory call, and checking its struct version;
+  * clamping out-of-range driver values;
+  * every `nvmlInit` being matched by `nvmlShutdown`.
+* GPU, AMD: amdgpu sysfs fixtures with a connector entry and an Intel card
+  that must both be ignored.
 * The command-line parser, including 18 invalid inputs.
 * Layout: 16 terminal sizes from 1×1 to 2000×30, in 6 display modes. The
   test checks that every emitted row is exactly the terminal width, that no
@@ -274,7 +336,12 @@ results do not depend on the host. The suite covers:
 * The real binary in a pseudo terminal, quitting through `q`, Ctrl-C,
   SIGTERM, SIGHUP and every key. The test verifies exit status 0, a
   byte-identical termios afterwards, the alternate screen left, and no
-  sanitizer reports.
+  sanitizer reports. On a machine with an NVIDIA GPU this also exercises
+  the real NVML.
+
+NVIDIA's own libraries leak a few hundred bytes once inside
+`pthread_once`. `tests/lsan.supp` suppresses exactly those two libraries,
+so dcmon's own code stays fully leak-checked.
 * Exit codes for invalid arguments and for a non-terminal stdout.
 
 ## Benchmarking
@@ -309,22 +376,57 @@ These numbers come from one machine. They are measured, not estimated.
 * 6 filesystems, 4 of them 9p (Windows drives). WSL2 has no hwmon
   sensors, so temperature showed `N/A`.
 
+* GPU: NVIDIA GeForce RTX 3060 Ti, driver 610.47, through WSL2's NVML
+  (`/usr/lib/wsl/lib`), idle at the time.
+
 Each run lasted 60 s, except the syscall counts, which use the 25 s − 5 s
-difference described above.
+difference described above. All threads are counted.
+
+**Without GPU** (`--no-gpu`, or a machine with no GPU):
 
 | Interval | Frames | CPU time | CPU (% of one core) | Peak RSS | Output | Bytes per frame | Syscalls/s | Syscalls per refresh |
 |---|---|---|---|---|---|---|---|---|
-| 250 ms  | 247 | 0.231 s | 0.386 % | 3652 KiB | 4259 B/s | 1035 | 37.5 | 9.4 |
-| 500 ms  | 129 | 0.093 s | 0.156 % | 3624 KiB | 2667 B/s | 1240 | 19.4 | 9.7 |
-| 1000 ms |  73 | 0.080 s | 0.134 % | 3708 KiB | 1864 B/s | 1532 | 12.1 | 12.1 |
-| 2000 ms |  43 | 0.052 s | 0.086 % | 3704 KiB |  968 B/s | 1351 |  7.7 | 15.3 |
+| 250 ms  | 247 | 0.247 s | 0.412 % | 3644 KiB | 4433 B/s | 1077 | 37.5 | 9.4 |
+| 1000 ms |  73 | 0.078 s | 0.130 % | 3580 KiB | 1461 B/s | 1201 | 12.2 | 12.2 |
+| 2000 ms |  43 | 0.048 s | 0.080 % | 3404 KiB |  876 B/s | 1222 |  8.3 | 16.5 |
 
-**Executable:** 63,616 bytes stripped (text 50,146, data 3,188). The only
-dynamic dependency is libc. Most of the ~3.6 MiB peak RSS is glibc and the
+**With the NVIDIA GPU** (default when NVML is present):
+
+| Interval | Frames | CPU time | CPU (% of one core) | Peak RSS | Output | Bytes per frame | Syscalls/s | Syscalls per refresh |
+|---|---|---|---|---|---|---|---|---|
+| 250 ms  | 246 | 0.227 s | 0.378 % | 27748 KiB | 4308 B/s | 1051 | 49.6 | 12.4 |
+| 1000 ms |  72 | 0.127 s | 0.212 % | 28084 KiB | 2006 B/s | 1671 | 24.4 | 24.4 |
+| 2000 ms |  42 | 0.079 s | 0.132 % | 27724 KiB | 1326 B/s | 1894 | 13.9 | 27.8 |
+
+At 250 ms the GPU is sampled once per second, not four times. Before that
+limit, the same run measured 0.798 % CPU and 86.1 syscalls/s. At 1000 ms
+and above the code path is the same as before, so the CPU differences
+there (0.287 % → 0.212 %, 0.180 % → 0.132 %) are variation between runs.
+
+**What the GPU costs:** NVML is by far the most expensive part of dcmon.
+
+* **Memory:** loading it (plus `libcuda.so` under WSL2) raises peak RSS
+  from about 3.6 MiB to about 27 MiB.
+* **CPU:** roughly 1.5–2× the CPU time of `--no-gpu`.
+* **Syscalls:** about 12 per GPU sample, i.e. about 12 per second. In the
+  25 s run at 1000 ms that was
+  228 `ioctl`, 165 `getpid` and about 40 `openat`/`mmap`, issued by NVML
+  itself. NVML also starts one worker thread.
+
+The numbers come from WSL2's NVML, which talks to `/dev/dxg`. The native
+Linux driver uses a different path, so measure it with
+`sh tests/bench.sh ./dcmon 60 120x40` on that machine.
+
+If you don't need the GPU, run `--no-gpu`. The library is then not loaded
+at all. The `g` key only stops the queries; the library stays loaded.
+
+**Executable:** 67,712 bytes stripped (text 56,887, data 3,316). The only
+dynamic dependency is libc; NVML is loaded with `dlopen()` only when
+present. Without the GPU, most of the ~3.6 MiB peak RSS is glibc and the
 dynamic loader. dcmon's own heap use is a few tens of KiB: the `/proc` read
 buffers, the line buffer and the per-row hashes.
 
-**Syscall mix:** a 25 s run at 1000 ms made these calls:
+**Syscall mix without GPU:** a 25 s run at 1000 ms made these calls:
 
 * 137 `pread64`: `/proc/stat`, `/proc/loadavg`, `/proc/meminfo`,
   `/proc/net/dev`, operstate.
@@ -357,12 +459,16 @@ src/memory.c        /proc/meminfo
 src/network.c       /proc/net/dev, routes, operstate
 src/disk.c          mountinfo, statvfs, async probe for network/FUSE mounts
 src/temperature.c   hwmon / thermal-zone discovery and reading
+src/gpu.c           NVIDIA via NVML (dlopen), AMD via amdgpu sysfs
 src/histogram.c     ring buffers and scaling
 src/renderer.c      layout, glyphs, colours, diffed output
 src/terminal.c      termios, alternate screen, output buffer, crash restore
 src/util.c          pread helpers, integer parsing, formatting
 tests/test.c        test-suite
 tests/bench.sh      benchmark helper (not used at runtime)
+tests/sccount.c     ptrace-based syscall counter for the benchmark (all threads)
+tests/fake_nvml.c   stand-in libnvidia-ml.so for the GPU tests
+tests/lsan.supp     LeakSanitizer suppressions for NVIDIA's libraries
 ```
 
 ## License

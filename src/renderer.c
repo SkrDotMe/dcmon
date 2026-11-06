@@ -18,7 +18,8 @@
 /* ---- colours ---------------------------------------------------------- */
 
 enum { C_RESET, C_TEXT, C_DIM, C_BORDER, C_TITLE, C_BOLD, C_CPU, C_CPU_B, C_RAM, C_RAM_B,
-       C_DL, C_DL_B, C_UL, C_UL_B, C_DISK, C_DISK_B, C_GOOD, C_WARN, C_HOT, C_EMPTY, C_COUNT };
+       C_DL, C_DL_B, C_UL, C_UL_B, C_DISK, C_DISK_B, C_GPU, C_GPU_B, C_GOOD, C_WARN, C_HOT,
+       C_EMPTY, C_COUNT };
 
 static const char *const SGR256[C_COUNT] = {
     [C_RESET] = "\x1b[0m",          [C_TEXT] = "\x1b[0;38;5;252m",   [C_DIM] = "\x1b[0;38;5;245m",
@@ -26,7 +27,8 @@ static const char *const SGR256[C_COUNT] = {
     [C_CPU] = "\x1b[0;38;5;80m",     [C_CPU_B] = "\x1b[0;1;38;5;80m",  [C_RAM] = "\x1b[0;38;5;114m",
     [C_RAM_B] = "\x1b[0;1;38;5;114m", [C_DL] = "\x1b[0;38;5;75m",      [C_DL_B] = "\x1b[0;1;38;5;75m",
     [C_UL] = "\x1b[0;38;5;141m",     [C_UL_B] = "\x1b[0;1;38;5;141m",  [C_DISK] = "\x1b[0;38;5;221m",
-    [C_DISK_B] = "\x1b[0;1;38;5;221m", [C_GOOD] = "\x1b[0;38;5;114m",  [C_WARN] = "\x1b[0;38;5;221m",
+    [C_DISK_B] = "\x1b[0;1;38;5;221m", [C_GPU] = "\x1b[0;38;5;209m",   [C_GPU_B] = "\x1b[0;1;38;5;209m",
+    [C_GOOD] = "\x1b[0;38;5;114m",    [C_WARN] = "\x1b[0;38;5;221m",
     [C_HOT] = "\x1b[0;1;38;5;203m",  [C_EMPTY] = "\x1b[0;38;5;238m",
 };
 static const char *const SGR16[C_COUNT] = {
@@ -35,7 +37,8 @@ static const char *const SGR16[C_COUNT] = {
     [C_CPU] = "\x1b[0;36m",  [C_CPU_B] = "\x1b[0;1;36m", [C_RAM] = "\x1b[0;32m",
     [C_RAM_B] = "\x1b[0;1;32m", [C_DL] = "\x1b[0;34m",   [C_DL_B] = "\x1b[0;1;34m",
     [C_UL] = "\x1b[0;35m",   [C_UL_B] = "\x1b[0;1;35m", [C_DISK] = "\x1b[0;33m",
-    [C_DISK_B] = "\x1b[0;1;33m", [C_GOOD] = "\x1b[0;32m", [C_WARN] = "\x1b[0;33m",
+    [C_DISK_B] = "\x1b[0;1;33m", [C_GPU] = "\x1b[0;91m", [C_GPU_B] = "\x1b[0;1;91m",
+    [C_GOOD] = "\x1b[0;32m", [C_WARN] = "\x1b[0;33m",
     [C_HOT] = "\x1b[0;1;31m", [C_EMPTY] = "\x1b[0;90m",
 };
 
@@ -302,7 +305,8 @@ static void draw_graph(const hist_t *h, int w, int row, int height, uint64_t sca
 
 enum { RW_BLANK, RW_RULE, RW_CPU_HDR, RW_CPU_BAR, RW_CPU_GRAPH, RW_CORES, RW_TEMP, RW_MEM_HDR,
        RW_MEM_BAR, RW_MEM_GRAPH, RW_NET_HDR, RW_DL_HDR, RW_DL_GRAPH, RW_UL_HDR, RW_UL_GRAPH,
-       RW_NET_TOT, RW_DISK_HDR, RW_DISK, RW_DISK_BAR, RW_DISK_MORE, RW_DISK_NONE, RW_HELP };
+       RW_NET_TOT, RW_DISK_HDR, RW_DISK, RW_DISK_BAR, RW_DISK_MORE, RW_DISK_NONE, RW_HELP,
+       RW_GPU_HDR, RW_GPU_BAR, RW_GPU_GRAPH, RW_GPU_MEM };
 
 typedef struct {
     uint8_t  kind, sub, h;
@@ -315,10 +319,10 @@ typedef struct {
     int   n;
 } col_t;
 
-enum { S_CPU = 1, S_MEM = 2, S_NET = 4, S_DISK = 8, S_ALL = 15 };
+enum { S_CPU = 1, S_MEM = 2, S_NET = 4, S_DISK = 8, S_GPU = 16, S_ALL = 31 };
 
 typedef struct {
-    int gcpu, gmem, gnet, rules, dbars, totals;
+    int gcpu, gmem, gnet, ggpu, rules, dbars, totals;
 } plan_t;
 
 static col_t colA, colB;
@@ -412,6 +416,16 @@ static int build(const app_t *a, col_t *c, int mask, int cw, const plan_t *p)
         for (int i = 0; i < p->gmem; i++)
             push(c, RW_MEM_GRAPH, i, p->gmem, 0);
     }
+    if ((mask & S_GPU) && a->gpu_on) {
+        for (unsigned g = 0; g < a->gpu.n; g++) {
+            SECTION();
+            push(c, RW_GPU_HDR, 0, 0, (int)g);
+            push(c, RW_GPU_BAR, 0, 0, (int)g);
+            for (int i = 0; i < p->ggpu; i++)
+                push(c, RW_GPU_GRAPH, i, p->ggpu, (int)g);
+            push(c, RW_GPU_MEM, 0, 0, (int)g);
+        }
+    }
     if (mask & S_NET) {
         SECTION();
         push(c, RW_NET_HDR, 0, 0, 0);
@@ -448,7 +462,8 @@ static int build(const app_t *a, col_t *c, int mask, int cw, const plan_t *p)
 /* Fit sections into bh rows: first drop decoration, then grow graphs. */
 static int fit(const app_t *a, col_t *c, int mask, int cw, int bh, plan_t *p)
 {
-    *p = (plan_t){1, 1, 1, 1, a->disk_detail, 1};
+    *p = (plan_t){1, 1, 1, 1, 1, a->disk_detail, 1};
+    int ngpu = ((mask & S_GPU) && a->gpu_on) ? (int)a->gpu.n : 0;
     int n = build(a, c, mask, cw, p);
     if (n > bh) {
         p->rules = 0;
@@ -479,6 +494,11 @@ static int fit(const app_t *a, col_t *c, int mask, int cw, int bh, plan_t *p)
             if ((mask & S_MEM) && p->gmem < 10 && extra >= 1) {
                 p->gmem++;
                 extra--;
+                ch = 1;
+            }
+            if (ngpu && p->ggpu < 8 && extra >= ngpu) {
+                p->ggpu++;
+                extra -= ngpu;
                 ch = 1;
             }
         }
@@ -772,6 +792,68 @@ static void row_disk(const app_t *a, int idx, int w)
     lb_pad(start + w);
 }
 
+static void row_gpu_hdr(const app_t *a, int idx, int w)
+{
+    const gpu_dev_t *d = &a->gpu.d[idx];
+    char name[72], clk[24], fan[24], pw[40], tmp[40], pct[24];
+    snprintf(name, sizeof name, "  %s", d->name);
+    seg_t l[2] = {{"GPU", C_GPU_B}, {name, C_TEXT}}, r[5];
+    int nr = 0;
+    if (d->has_clock) {
+        snprintf(clk, sizeof clk, "  %u MHz", d->clock_mhz);
+        r[nr++] = (seg_t){clk, C_DIM};
+    }
+    if (d->has_fan) {
+        snprintf(fan, sizeof fan, "  fan %u%%", d->fan_pct);
+        r[nr++] = (seg_t){fan, C_DIM};
+    }
+    if (d->has_power) {
+        if (d->limit_mw)
+            snprintf(pw, sizeof pw, "  %u / %u W", (d->power_mw + 500) / 1000, (d->limit_mw + 500) / 1000);
+        else
+            snprintf(pw, sizeof pw, "  %u W", (d->power_mw + 500) / 1000);
+        r[nr++] = (seg_t){pw, C_DIM};
+    }
+    if (d->has_temp) {
+        fmt_temp(tmp, sizeof tmp, "  ", d->temp);
+        r[nr++] = (seg_t){tmp, d->temp >= d->hot ? C_HOT : d->temp >= d->warn ? C_WARN : C_GOOD};
+    }
+    if (d->has_util) {
+        char p[16];
+        fmt_permille(p, sizeof p, d->util_pm);
+        snprintf(pct, sizeof pct, "  %6s", p);
+    } else {
+        snprintf(pct, sizeof pct, "  %6s", "--");
+    }
+    r[nr++] = (seg_t){pct, C_BOLD};
+    /* keep the full name; clock and fan are dropped first when narrow */
+    draw_lr(w, l, 2, r, nr, 3 + text_cols(name));
+}
+
+static void row_gpu_mem(const app_t *a, int idx, int w)
+{
+    const gpu_dev_t *d = &a->gpu.d[idx];
+    char r[64], b1[24], b2[24];
+    int start = L.col;
+    if (d->has_mem) {
+        fmt_bytes(b1, sizeof b1, d->vram_used);
+        fmt_bytes(b2, sizeof b2, d->vram_total);
+        snprintf(r, sizeof r, "  %s / %s", b1, b2);
+    } else {
+        snprintf(r, sizeof r, "  N/A");
+    }
+    int rw = text_cols(r);
+    lb_text("VRAM ", C_DIM);
+    int bw = w - 5 - rw;
+    if (bw >= 4) {
+        unsigned pm = d->has_mem ? (unsigned)(d->vram_used * 1000 / d->vram_total) : 0;
+        draw_bar(bw, pm, C_GPU);
+    }
+    lb_pad(start + w - rw);
+    lb_text(r, C_TEXT);
+    lb_pad(start + w);
+}
+
 static const char *const HELP_KEYS[][2] = {
     {"q", "quit"},
     {"+ / -", "faster / slower refresh"},
@@ -780,11 +862,12 @@ static const char *const HELP_KEYS[][2] = {
     {"d", "disk details on / off"},
     {"c", "per-core CPU view on / off"},
     {"t", "temperature details on / off"},
+    {"g", "GPU section on / off"},
     {"arrows PgUp PgDn", "scroll when the window is too small"},
     {"h / Esc", "close this help"},
 };
 #define HELP_NKEYS ((int)(sizeof HELP_KEYS / sizeof HELP_KEYS[0]))
-#define HELP_ROWS  (HELP_NKEYS + 7)
+#define HELP_ROWS  (HELP_NKEYS + 8)
 
 static void row_help(const app_t *a, int i, int w)
 {
@@ -806,7 +889,8 @@ static void row_help(const app_t *a, int i, int w)
     switch (i) {
     case 0:
         k = "refresh";
-        snprintf(buf, sizeof buf, "%u ms cpu/ram/net, temp %u ms, disk %u ms", a->interval_ms,
+        snprintf(buf, sizeof buf, "%u ms cpu/ram/net, gpu %u ms, temp %u ms, disk %u ms",
+                 a->interval_ms, a->interval_ms > 1000 ? a->interval_ms : 1000,
                  a->interval_ms > 2000 ? a->interval_ms : 2000,
                  a->interval_ms > 10000 ? a->interval_ms : 10000);
         break;
@@ -831,6 +915,15 @@ static void row_help(const app_t *a, int i, int w)
                  a->net.total_ifs == 1 ? "" : "s");
         break;
     case 3:
+        k = "gpu";
+        if (!a->gpu.n)
+            snprintf(buf, sizeof buf, "%s", a->cfg.no_gpu ? "disabled" : "no NVIDIA (NVML) or AMD GPU found");
+        else
+            snprintf(buf, sizeof buf, "%u device%s via %s%s", a->gpu.n, a->gpu.n == 1 ? "" : "s",
+                     a->gpu.d[0].vendor == GPU_NVIDIA ? "NVML" : "amdgpu sysfs",
+                     a->gpu_on ? "" : " (hidden)");
+        break;
+    case 4:
         k = "display";
         snprintf(buf, sizeof buf, "%s, %s, %dx%d",
                  a->color_mode == 2 ? "256 colors" : a->color_mode ? "16 colors" : "no colors",
@@ -883,6 +976,14 @@ static void draw_row(const app_t *a, const row_t *r, int w)
     }
     case RW_DISK_NONE: lb_text("no filesystems to show", C_DIM); break;
     case RW_HELP: row_help(a, r->arg, w); break;
+    case RW_GPU_HDR: row_gpu_hdr(a, r->arg, w); break;
+    case RW_GPU_BAR: {
+        const gpu_dev_t *d = &a->gpu.d[r->arg];
+        draw_bar(w, d->has_util ? d->util_pm : 0, C_GPU);
+        break;
+    }
+    case RW_GPU_GRAPH: draw_graph(&a->gpu.d[r->arg].hist, w, r->sub, r->h, 1000, C_GPU); break;
+    case RW_GPU_MEM: row_gpu_mem(a, r->arg, w); break;
     default: break;
     }
 }
@@ -925,7 +1026,7 @@ static void draw_bottom(const app_t *a, int W, int split)
 {
     static const char *const hints[][2] = {{"q", "quit"},  {"+/-", "speed"}, {"h", "help"},
                                            {"n", "net"},   {"c", "cores"},   {"d", "disks"},
-                                           {"t", "temp"}};
+                                           {"t", "temp"},  {"g", "gpu"}};
     char right[48] = "";
     if (a->scroll_max > 0)
         snprintf(right, sizeof right, " %s%s %d/%d ", G->up, G->down, a->scroll, a->scroll_max);
@@ -1040,7 +1141,7 @@ void render_frame(app_t *a)
             if (W >= 110) {
                 cwL = (W - 7) / 2;
                 cwR = W - 7 - cwL;
-                int nA = fit(a, &colA, S_CPU | S_MEM, cwL, bh, &p);
+                int nA = fit(a, &colA, S_CPU | S_MEM | S_GPU, cwL, bh, &p);
                 int nB = fit(a, &colB, S_NET | S_DISK, cwR, bh, &p);
                 two = nA <= bh && nB <= bh;
                 cwn = cwR;

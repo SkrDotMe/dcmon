@@ -15,7 +15,7 @@ typedef struct {
     const char *iface;
     const char *mounts[CLI_MAX_MOUNTS];
     unsigned    nmounts;
-    int         all_mounts, no_colors, no_temps, ascii, stats;
+    int         all_mounts, no_colors, no_temps, no_gpu, ascii, stats;
     int32_t     temp_warn, temp_hot; /* millidegrees, 0 = automatic */
     unsigned    duration_s;          /* 0 = run until quit          */
 } config_t;

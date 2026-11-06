@@ -6,6 +6,7 @@
  * tests run the real binary inside a pseudo terminal.
  *
  * Usage: build/tests ./dcmon-debug */
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -29,6 +30,7 @@
 static int g_fail, g_checks;
 static char g_tmp[256];
 static const char *g_bin;
+static const char *g_fake = "build/libfake_nvml.so";
 
 #define CHECK(cond)                                                              \
     do {                                                                         \
@@ -659,6 +661,102 @@ static void test_temperature(void)
     temp_free(&t);
 }
 
+/* ---- GPU ----------------------------------------------------------------- */
+
+static void test_gpu(void)
+{
+    static gpu_t g;
+    fx_reset(); /* empty /sys: no AMD cards */
+
+    /* library missing or driver not loaded: no GPU section, no crash */
+    CHECK(gpu_init(&g, "/nonexistent/libnvidia-ml.so.1") == -1);
+    CHECK(g.n == 0 && g.lib == NULL);
+    gpu_sample(&g, 1);
+    gpu_free(&g);
+
+    void *h = dlopen(g_fake, RTLD_NOW | RTLD_LOCAL);
+    CHECK(h != NULL);
+    if (!h) {
+        fprintf(stderr, "  cannot load %s: %s\n", g_fake, dlerror());
+        return;
+    }
+    void (*set)(unsigned, unsigned long long, unsigned);
+    void (*fail)(int);
+    int (*balance)(void);
+    void *p = dlsym(h, "fake_nvml_set");
+    memcpy(&set, &p, sizeof p);
+    p = dlsym(h, "fake_nvml_fail");
+    memcpy(&fail, &p, sizeof p);
+    p = dlsym(h, "fake_nvml_balance");
+    memcpy(&balance, &p, sizeof p);
+
+    fail(1);
+    CHECK(gpu_init(&g, g_fake) == -1);
+    CHECK(g.n == 0 && g.lib == NULL);
+    gpu_free(&g);
+    fail(0);
+
+    CHECK(gpu_init(&g, g_fake) == 0);
+    CHECK(g.n == 2);
+    gpu_dev_t *d = &g.d[0];
+    CHECK(d->vendor == GPU_NVIDIA);
+    CHECK_STR(d->name, "NVIDIA GeForce RTX 3060 Ti");
+    CHECK(d->has_util && d->util_pm == 370);
+    /* _v2 preferred: excludes the 256 MiB the fake driver reserves */
+    CHECK(d->has_mem && d->vram_total == 8ULL << 30 && d->vram_used == 2ULL << 30);
+    CHECK(d->has_temp && d->temp == 54000);
+    CHECK(d->hot == 83000 && d->warn == 73000); /* slowdown 93 C - 10 / - 20 */
+    CHECK(d->has_power && d->power_mw == 120400 && d->limit_mw == 200000);
+    CHECK(d->has_fan && d->fan_pct == 45);
+    CHECK(d->has_clock && d->clock_mhz == 1530);
+
+    /* second device: most queries unsupported -> those values hidden */
+    gpu_dev_t *e = &g.d[1];
+    CHECK_STR(e->name, "Fake Tesla");
+    CHECK(!e->has_util && !e->has_mem && !e->has_power && !e->has_fan && !e->has_clock);
+    CHECK(e->has_temp && e->temp == 40000);
+    CHECK(e->warn == 75000 && e->hot == 85000);
+
+    set(150, 9ULL << 30, 250); /* out-of-range values from a broken driver */
+    gpu_sample(&g, 1);
+    CHECK(d->util_pm == 1000);
+    CHECK(d->vram_used == d->vram_total);
+    CHECK(!d->has_temp);
+    CHECK(hist_get(&d->hist, 0) == 1000);
+    CHECK(hist_get(&e->hist, 0) == HIST_NONE);
+    set(37, 2ULL << 30, 54);
+    gpu_free(&g);
+    CHECK(balance() == 0); /* every nvmlInit matched by nvmlShutdown */
+    dlclose(h);
+
+    /* AMD via amdgpu sysfs; Intel cards and connectors ignored */
+    fx_write("/sys/class/drm/card0/device/vendor", "0x1002\n");
+    fx_write("/sys/class/drm/card0/device/gpu_busy_percent", "63\n");
+    fx_write("/sys/class/drm/card0/device/mem_info_vram_used", "1073741824\n");
+    fx_write("/sys/class/drm/card0/device/mem_info_vram_total", "17163091968\n");
+    fx_write("/sys/class/drm/card0/device/hwmon/hwmon5/temp1_input", "61000\n");
+    fx_write("/sys/class/drm/card0/device/hwmon/hwmon5/temp1_crit", "100000\n");
+    fx_write("/sys/class/drm/card0/device/hwmon/hwmon5/power1_average", "85000000\n");
+    fx_write("/sys/class/drm/card0/device/hwmon/hwmon5/power1_cap", "150000000\n");
+    fx_write("/sys/class/drm/card0-DP-1/status", "connected\n");
+    fx_write("/sys/class/drm/card1/device/vendor", "0x8086\n");
+    fx_write("/sys/class/drm/card1/device/gpu_busy_percent", "5\n");
+    CHECK(gpu_init(&g, "/nonexistent/libnvidia-ml.so.1") == 0);
+    CHECK(g.n == 1);
+    d = &g.d[0];
+    CHECK(d->vendor == GPU_AMD);
+    CHECK_STR(d->name, "AMD Radeon (card0)");
+    CHECK(d->util_pm == 630);
+    CHECK(d->vram_used == 1073741824ULL && d->vram_total == 17163091968ULL);
+    CHECK(d->temp == 61000 && d->hot == 85000 && d->warn == 75000);
+    CHECK(d->power_mw == 85000 && d->limit_mw == 150000);
+    CHECK(!d->has_fan && !d->has_clock);
+    fx_write("/sys/class/drm/card0/device/gpu_busy_percent", "garbage\n");
+    gpu_sample(&g, 1);
+    CHECK(!d->has_util && hist_get(&d->hist, 0) == HIST_NONE);
+    gpu_free(&g);
+}
+
 /* ---- CLI ----------------------------------------------------------------- */
 
 static int parse(config_t *c, char *err, ...)
@@ -687,6 +785,7 @@ static void test_cli(void)
     CHECK(parse(&c, err, "--mount", "/", "--mount", "/home", NULL) == CLI_RUN && c.nmounts == 2);
     CHECK(parse(&c, err, "--all-mounts", "--no-colors", "--no-temperatures", NULL) == CLI_RUN &&
           c.all_mounts && c.no_colors && c.no_temps);
+    CHECK(parse(&c, err, "--no-gpu", NULL) == CLI_RUN && c.no_gpu);
     CHECK(parse(&c, err, "--temp-warn", "70", "--temp-hot", "85", NULL) == CLI_RUN &&
           c.temp_warn == 70000 && c.temp_hot == 85000);
     CHECK(parse(&c, err, "--temp-hot", "90", NULL) == CLI_RUN && c.temp_warn == 75000);
@@ -761,12 +860,14 @@ static void setup_app(app_t *a)
     net_init(&a->net, NULL);
     disk_init(&a->disk, NULL, 0, 0);
     temp_init(&a->temp, 0, 0);
+    a->gpu_on = gpu_init(&a->gpu, g_fake) == 0; /* two fake NVIDIA GPUs */
     for (int s = 2; s < 40; s++) {
         fixture_system(s);
         cpu_sample(&a->cpu, 1);
         mem_sample(&a->mem, 1);
         usleep(1000);
         net_sample(&a->net, 1);
+        gpu_sample(&a->gpu, 1);
     }
 }
 
@@ -777,6 +878,7 @@ static void teardown_app(app_t *a)
     net_free(&a->net);
     disk_free(&a->disk);
     temp_free(&a->temp);
+    gpu_free(&a->gpu);
 }
 
 static char g_out[1 << 21];
@@ -858,6 +960,7 @@ static void test_render(void)
         a->cores = mode != 5;
         a->disk_detail = mode != 5;
         a->temp_detail = mode == 5;
+        a->gpu_on = a->gpu.n && mode != 4; /* layouts with and without GPU */
         for (size_t k = 0; k < sizeof sizes / sizeof sizes[0]; k++) {
             int W = sizes[k][0], H = sizes[k][1];
             a->cols = W;
@@ -1012,6 +1115,7 @@ static int run_in_pty(const char *bin, const char *keys, int sig, struct termios
         close(s);
         setenv("TERM", "xterm-256color", 1);
         setenv("ASAN_OPTIONS", "detect_leaks=1", 1);
+        /* LSAN_OPTIONS (suppressions for NVIDIA's libraries) is inherited */
         char *argv[16] = {(char *)bin, "--duration", "20"};
         int ac = 3;
         for (int i = 0; extra && extra[i] && ac < 15; i++)
@@ -1152,6 +1256,8 @@ static void test_binary_cli(void)
 int main(int argc, char **argv)
 {
     g_bin = argc > 1 ? argv[1] : "./dcmon-debug";
+    if (argc > 2)
+        g_fake = argv[2];
     RUN(test_histogram);
     RUN(test_format);
     RUN(test_cpu);
@@ -1160,6 +1266,7 @@ int main(int argc, char **argv)
     RUN(test_network);
     RUN(test_disk);
     RUN(test_temperature);
+    RUN(test_gpu);
     RUN(test_cli);
     RUN(test_render);
     RUN(test_eintr);

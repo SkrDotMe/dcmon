@@ -6,6 +6,7 @@
  * filesystem probe runs, its result pipe.  Nothing busy-waits. */
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +23,7 @@
 #include "util.h"
 
 #define SLACK_NS     (20 * NS_PER_MS) /* coalesce timers due within 20 ms */
+#define GPU_IV_MS    1000u            /* NVML calls cost ioctls: max 1/s   */
 #define TEMP_IV_MS   2000u
 #define DISK_IV_MS   10000u
 #define MI_MIN_GAP   NS_PER_SEC       /* rediscover mounts at most 1/s     */
@@ -30,6 +32,7 @@ static app_t A;
 
 static const unsigned STEPS[] = {100, 200, 250, 500, 1000, 2000, 3000, 5000, 10000, 30000, 60000};
 
+static unsigned gpu_iv(const app_t *a) { return a->interval_ms > GPU_IV_MS ? a->interval_ms : GPU_IV_MS; }
 static unsigned temp_iv(const app_t *a) { return a->interval_ms > TEMP_IV_MS ? a->interval_ms : TEMP_IV_MS; }
 static unsigned disk_iv(const app_t *a) { return a->interval_ms > DISK_IV_MS ? a->interval_ms : DISK_IV_MS; }
 
@@ -98,6 +101,10 @@ static int handle_key(app_t *a, int c)
     case 'd': case 'D': a->disk_detail = !a->disk_detail; break;
     case 'c': case 'C': a->cores = !a->cores; break;
     case 't': case 'T': a->temp_detail = !a->temp_detail; return K_SAMPLE_TEMP;
+    case 'g': case 'G':
+        if (a->gpu.n)
+            a->gpu_on = !a->gpu_on;
+        break;
     case 'k': a->scroll--; break;
     case 'j': a->scroll++; break;
     default: break;
@@ -200,20 +207,27 @@ int main(int argc, char **argv)
     if (gethostname(a->host, sizeof a->host - 1) != 0)
         a->host[0] = '\0';
 
+    /* Block the signals before anything can start a thread: NVML creates
+     * worker threads in nvmlInit(), and threads inherit the signal mask.  If
+     * they did not, SIGINT/SIGTERM could be delivered to such a thread and
+     * kill dcmon without restoring the terminal. */
+    sigset_t set;
+    sigemptyset(&set);
+    static const int sigs[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGWINCH, SIGTSTP, SIGCONT};
+    for (size_t i = 0; i < ARRAY_LEN(sigs); i++)
+        sigaddset(&set, sigs[i]);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+    signal(SIGPIPE, SIG_IGN);
+
     cpu_init(&a->cpu);
     mem_init(&a->mem);
     net_init(&a->net, cfg.iface);
     disk_init(&a->disk, cfg.mounts, cfg.nmounts, cfg.all_mounts);
     if (a->temps_on)
         temp_init(&a->temp, cfg.temp_warn, cfg.temp_hot);
+    if (!cfg.no_gpu)
+        a->gpu_on = gpu_init(&a->gpu, NULL) == 0;
 
-    sigset_t set;
-    sigemptyset(&set);
-    static const int sigs[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGWINCH, SIGTSTP, SIGCONT};
-    for (size_t i = 0; i < ARRAY_LEN(sigs); i++)
-        sigaddset(&set, sigs[i]);
-    sigprocmask(SIG_BLOCK, &set, NULL);
-    signal(SIGPIPE, SIG_IGN);
     int sfd = signalfd(-1, &set, SFD_NONBLOCK | SFD_CLOEXEC);
     int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     if (sfd < 0 || tfd < 0) {
@@ -231,6 +245,7 @@ int main(int argc, char **argv)
     uint64_t start = mono_ns(), now = start;
     uint64_t iv = a->interval_ms * NS_PER_MS;
     uint64_t t_fast = now + (iv < 250 * NS_PER_MS ? iv : 250 * NS_PER_MS); /* quick first sample */
+    uint64_t t_gpu = t_fast; /* first GPU sample together with the first fast tick */
     uint64_t t_temp = now + temp_iv(a) * NS_PER_MS;
     uint64_t t_disk = now + disk_iv(a) * NS_PER_MS;
     uint64_t t_end = cfg.duration_s ? now + cfg.duration_s * NS_PER_SEC : UINT64_MAX;
@@ -249,6 +264,11 @@ int main(int argc, char **argv)
             t_fast = advance(t_fast, iv, now);
             dirty = 1;
             slack = iv / 2;
+        }
+        if (a->gpu_on && now + slack >= t_gpu) { /* hidden GPU section costs nothing */
+            gpu_sample(&a->gpu, 1);
+            t_gpu = advance(t_gpu, gpu_iv(a) * NS_PER_MS, now);
+            dirty = 1;
         }
         if (a->temps_on && now + slack >= t_temp) {
             temp_sample(&a->temp, a->temp_detail);
@@ -277,6 +297,7 @@ int main(int argc, char **argv)
         }
 
         uint64_t dl = t_fast;
+        if (a->gpu_on && t_gpu < dl) dl = t_gpu;
         if (a->temps_on && t_temp < dl) dl = t_temp;
         if (t_disk < dl) dl = t_disk;
         if (t_mi < dl) dl = t_mi;
@@ -374,6 +395,7 @@ int main(int argc, char **argv)
     net_free(&a->net);
     disk_free(&a->disk);
     temp_free(&a->temp);
+    gpu_free(&a->gpu);
     render_free();
     close(sfd);
     close(tfd);

@@ -8,6 +8,7 @@ WARN     := -Wall -Wextra -Wpedantic -Wshadow -Wformat=2 -Wno-format-nonliteral
 SRC      := $(wildcard src/*.c)
 HDR      := $(wildcard src/*.h)
 LIB_SRC  := $(filter-out src/main.c,$(SRC))
+LDLIBS   := -ldl   # dlopen() for NVML; part of libc itself since glibc 2.34
 
 # Size-optimised release build: LTO, dead-section GC, no unwind tables,
 # stripped.  Stack protector and FORTIFY stay on for stability.
@@ -27,19 +28,23 @@ all: release
 release: dcmon
 
 dcmon: $(SRC) $(HDR)
-	$(CC) $(CPPFLAGS) $(RELEASE_CFLAGS) $(SRC) -o $@ $(RELEASE_LDFLAGS)
+	$(CC) $(CPPFLAGS) $(RELEASE_CFLAGS) $(SRC) -o $@ $(RELEASE_LDFLAGS) $(LDLIBS)
 
 debug: dcmon-debug
 
 dcmon-debug: $(SRC) $(HDR)
-	$(CC) $(CPPFLAGS) $(DEBUG_CFLAGS) $(SRC) -o $@ $(DEBUG_LDFLAGS)
+	$(CC) $(CPPFLAGS) $(DEBUG_CFLAGS) $(SRC) -o $@ $(DEBUG_LDFLAGS) $(LDLIBS)
+
+build/libfake_nvml.so: tests/fake_nvml.c
+	@mkdir -p build
+	$(CC) $(STD) -O1 -fPIC -shared $(WARN) tests/fake_nvml.c -o $@
 
 build/tests: $(LIB_SRC) $(HDR) tests/test.c
 	@mkdir -p build
-	$(CC) $(CPPFLAGS) $(DEBUG_CFLAGS) $(LIB_SRC) tests/test.c -o $@ $(DEBUG_LDFLAGS)
+	$(CC) $(CPPFLAGS) $(DEBUG_CFLAGS) $(LIB_SRC) tests/test.c -o $@ $(DEBUG_LDFLAGS) $(LDLIBS)
 
-test: build/tests dcmon-debug
-	ASAN_OPTIONS=detect_leaks=1 ./build/tests ./dcmon-debug
+test: build/tests build/libfake_nvml.so dcmon-debug
+	ASAN_OPTIONS=detect_leaks=1 LSAN_OPTIONS=suppressions=$(CURDIR)/tests/lsan.supp ./build/tests ./dcmon-debug build/libfake_nvml.so
 
 build/sccount: tests/sccount.c
 	@mkdir -p build

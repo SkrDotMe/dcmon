@@ -6,8 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { O_INTERVAL, O_IFACE, O_MOUNT, O_ALL, O_NOCOL, O_NOTEMP, O_ASCII, O_TWARN, O_THOT,
-       O_DURATION, O_STATS, O_HELP, O_VERSION };
+enum { O_INTERVAL, O_IFACE, O_MOUNT, O_ALL, O_NOCOL, O_NOTEMP, O_NOGPU, O_ASCII, O_TWARN,
+       O_THOT, O_DURATION, O_STATS, O_HELP, O_VERSION };
 
 static const struct {
     const char *lng;
@@ -17,7 +17,8 @@ static const struct {
     {"interval", 'i', O_INTERVAL, 1},   {"interface", 'n', O_IFACE, 1},
     {"mount", 'm', O_MOUNT, 1},         {"all-mounts", 'a', O_ALL, 0},
     {"no-colors", 0, O_NOCOL, 0},       {"no-color", 0, O_NOCOL, 0},
-    {"no-temperatures", 0, O_NOTEMP, 0}, {"ascii", 0, O_ASCII, 0},
+    {"no-temperatures", 0, O_NOTEMP, 0}, {"no-gpu", 0, O_NOGPU, 0},
+    {"ascii", 0, O_ASCII, 0},
     {"temp-warn", 0, O_TWARN, 1},       {"temp-hot", 0, O_THOT, 1},
     {"duration", 0, O_DURATION, 1},     {"stats", 0, O_STATS, 0},
     {"help", 'h', O_HELP, 0},           {"version", 'V', O_VERSION, 0},
@@ -34,6 +35,7 @@ const char *cli_usage(void)
            "  -a, --all-mounts         show every mount, including virtual filesystems\n"
            "      --no-colors          disable colors (NO_COLOR is honoured too)\n"
            "      --no-temperatures    disable temperature sensors\n"
+           "      --no-gpu             do not load NVML or scan for GPUs\n"
            "      --temp-warn C        warm threshold in degrees Celsius (default: from sensor)\n"
            "      --temp-hot C         hot threshold in degrees Celsius (default: from sensor)\n"
            "      --ascii              ASCII-only drawing (auto when the locale is not UTF-8)\n"
@@ -43,7 +45,8 @@ const char *cli_usage(void)
            "  -V, --version            show version\n"
            "\n"
            "Keys: q quit, +/- faster/slower, r reset graphs, h help, n next interface,\n"
-           "      d disk details, c CPU cores, t temperature details, arrows/PgUp/PgDn scroll\n";
+           "      d disk details, c CPU cores, t temperature details, g GPU section,\n"
+           "      arrows/PgUp/PgDn scroll\n";
 }
 
 static int num(const char *s, long lo, long hi, long *out)
@@ -134,6 +137,7 @@ int cli_parse(int argc, char **argv, config_t *c, char *err, size_t errcap)
         case O_ALL:      c->all_mounts = 1; break;
         case O_NOCOL:    c->no_colors = 1; break;
         case O_NOTEMP:   c->no_temps = 1; break;
+        case O_NOGPU:    c->no_gpu = 1; break;
         case O_ASCII:    c->ascii = 1; break;
         case O_STATS:    c->stats = 1; break;
         case O_HELP:     return CLI_HELP;

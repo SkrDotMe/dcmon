@@ -5,6 +5,7 @@
 #include "cli.h"
 #include "cpu.h"
 #include "disk.h"
+#include "gpu.h"
 #include "memory.h"
 #include "network.h"
 #include "temperature.h"
@@ -16,7 +17,9 @@ typedef struct app {
     net_t    net;
     disks_t  disk;
     temp_t   temp;
+    gpu_t    gpu;
     int      temps_on;
+    int      gpu_on;     /* GPU section visible (and sampled) */
     unsigned interval_ms;
     int      cols, rows;
     int      help, cores, temp_detail, disk_detail;

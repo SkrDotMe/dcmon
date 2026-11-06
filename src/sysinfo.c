@@ -324,11 +324,6 @@ static kv_t *bar(kvlist_t *o, const char *k, unsigned pm, int color, const char 
     return r;
 }
 
-static int pm_color(unsigned pm)
-{
-    return pm >= 900 ? KC_HOT : pm >= 750 ? KC_WARN : KC_TEXT;
-}
-
 /* micro-units -> "12.45" (2 decimals) */
 static void fmt_micro(char *o, size_t cap, int64_t v, const char *unit)
 {
@@ -359,7 +354,7 @@ static void battery_summary(const battery_t *b, char *o, size_t cap)
 void view_info(const struct app *a, kvlist_t *o)
 {
     const sysinfo_t *s = &a->si;
-    char b1[32], b2[32], t[96];
+    char b1[32], t[96];
     o->n = 0;
     add(o, KV_HEAD, "", KC_TEXT, "%s@%s", s->user, a->host[0] ? a->host : "localhost");
     add(o, KV_BLANK, "", 0, NULL);
@@ -393,13 +388,10 @@ void view_info(const struct app *a, kvlist_t *o)
     }
     if (s->sockets > 1)
         add(o, KV_ROW, "Sockets", KC_TEXT, "%u", s->sockets);
-    char fq[48] = "";
-    if (a->cpu.khz_avg) {
+    if (a->cpu.khz_avg) { /* not shown where cpufreq is missing (WSL2, many VMs) */
         fmt_khz(b1, sizeof b1, a->cpu.khz_avg, 0);
-        snprintf(fq, sizeof fq, ", %s avg", b1);
+        add(o, KV_ROW, "CPU frequency", KC_TEXT, "%s avg", b1);
     }
-    bar(o, "CPU usage", a->cpu.all.pm, pm_color(a->cpu.all.pm), "%u.%u%%, load %s%s", a->cpu.all.pm / 10,
-        a->cpu.all.pm % 10, a->cpu.load, fq);
     int32_t tv;
     if (a->temps_on && temp_value(&a->temp, &tv)) {
         fmt_mdeg(b1, sizeof b1, tv);
@@ -417,24 +409,21 @@ void view_info(const struct app *a, kvlist_t *o)
             add(o, KV_ROW, k, KC_TEXT, "%s", d->name);
         }
     }
+    /* sizes only: the monitor itself shows the usage */
     if (a->mem.ok) {
-        fmt_bytes(b1, sizeof b1, a->mem.used);
-        fmt_bytes(b2, sizeof b2, a->mem.total);
-        bar(o, "Memory", a->mem.pm, pm_color(a->mem.pm), "%s / %s (%u%%)", b1, b2, (a->mem.pm + 5) / 10);
+        fmt_bytes(b1, sizeof b1, a->mem.total);
+        add(o, KV_ROW, "Memory", KC_TEXT, "%s", b1);
         if (a->mem.swap_total) {
-            unsigned pm = (unsigned)(a->mem.swap_used * 1000 / a->mem.swap_total);
-            fmt_bytes(b1, sizeof b1, a->mem.swap_used);
-            fmt_bytes(b2, sizeof b2, a->mem.swap_total);
-            bar(o, "Swap", pm, pm_color(pm), "%s / %s (%u%%)", b1, b2, (pm + 5) / 10);
+            fmt_bytes(b1, sizeof b1, a->mem.swap_total);
+            add(o, KV_ROW, "Swap", KC_TEXT, "%s", b1);
         }
     }
     for (unsigned i = 0; i < a->disk.n; i++) {
         const disk_t *d = &a->disk.d[i];
         if (d->state != DS_OK || d->hide || strcmp(d->mnt, "/") != 0)
             continue;
-        fmt_bytes(b1, sizeof b1, d->used);
-        fmt_bytes(b2, sizeof b2, d->total);
-        bar(o, "Disk (/)", d->pm, pm_color(d->pm), "%s / %s (%u%%) %s", b1, b2, (d->pm + 9) / 10, d->fstype);
+        fmt_bytes(b1, sizeof b1, d->total);
+        add(o, KV_ROW, "Disk (/)", KC_TEXT, "%s %s", b1, d->fstype);
     }
     if (a->net.sel[0]) {
         char sp[24] = "";

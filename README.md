@@ -240,10 +240,12 @@ be counted twice. Disks that have never done any I/O are hidden.
 **`i`, system information:** a fastfetch-style summary: user and host,
 distribution, hardware model, kernel, virtualisation (WSL, Docker or Podman
 container, or the hypervisor vendor), uptime, tasks, shell, terminal,
-locale, CPU model with core and thread count and maximum frequency, CPU
-usage and temperature, GPUs with VRAM size, memory, swap, the root
-filesystem, the network interface with its address, and battery and AC
-state. The static facts are read once, the first time the view opens.
+locale, CPU model with core and thread count and maximum frequency, the
+current average CPU frequency (where cpufreq exists) and temperature, GPUs
+with VRAM size, the sizes of memory, swap and the root filesystem, the
+network interface with its address, and battery and AC state. Usage is left
+to the monitor itself. The static facts are read once, the first time the
+view opens.
 
 * CPU cores are counted from the distinct `physical id`/`core id` pairs in
   `/proc/cpuinfo`, so hyper-threads are not counted as cores.

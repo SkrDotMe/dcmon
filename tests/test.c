@@ -1740,6 +1740,30 @@ static void test_theme(void)
     char first[48];
     snprintf(first, sizeof first, "%s", theme_sgr(1, CM_TRUE, C_CPU)); /* shared buffer */
     CHECK(strcmp(first, theme_sgr(2, CM_TRUE, C_CPU)) != 0);
+
+    /* colours that carry meaning stay apart in every theme and mode that
+     * has its own colours; mono separates only by brightness */
+    static const int pairs[][2] = {{C_GOOD, C_WARN}, {C_WARN, C_HOT}, {C_GOOD, C_HOT}, {C_DL, C_UL},
+                                   {C_CPU, C_DL},    {C_CPU, C_RAM}, {C_DISK, C_GPU}, {C_TEXT, C_DIM},
+                                   {C_CPU, C_EMPTY}, {C_DIM, C_EMPTY}};
+    int same = 0;
+    for (int t = 0; t < theme_count(); t++)
+        for (int m = CM_256; m <= CM_TRUE; m++)
+            for (size_t k = 0; k < sizeof pairs / sizeof pairs[0]; k++) {
+                if (t == theme_find("mono") && k >= 3 && k <= 6)
+                    continue;
+                char x[48];
+                snprintf(x, sizeof x, "%s", theme_sgr(t, m, pairs[k][0]));
+                const char *y = theme_sgr(t, m, pairs[k][1]);
+                /* compare the colour only, not the bold attribute */
+                const char *cx = strstr(x, "38;"), *cy = strstr(y, "38;");
+                if (cx && cy && !strcmp(cx, cy)) {
+                    fprintf(stderr, "  theme %s mode %d: slots %d and %d share %s\n", theme_name(t), m,
+                            pairs[k][0], pairs[k][1], cx);
+                    same++;
+                }
+            }
+    CHECK(same == 0);
 }
 
 /* ---- alerts ---------------------------------------------------------------- */

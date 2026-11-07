@@ -181,11 +181,17 @@ dcmon --stream --count 60 --no-gpu | jq -s 'map(.cpu.usage_pct) | max'
 shown for 3 s in the top border and saved to the configuration file.
 `--theme NAME` or `theme = NAME` selects one at start-up.
 
-A theme is a set of RGB colours. Terminals that announce true colour
-(`COLORTERM=truecolor` or `24bit`) get them exactly; 256-colour terminals
-get the nearest colour of the 6×6×6 cube or the grey ramp (never the 16
-basic colours, which terminals redefine). 16-colour terminals keep their
-own palette, so there the themes only differ for `mono` and `light`.
+Each theme uses the official colours of its palette, given twice: as RGB
+for terminals that announce true colour (`COLORTERM=truecolor` or `24bit`)
+and as an xterm 256-colour index for the others. The indices are the
+themes' own 256-colour palettes where they publish one (gruvbox, Dracula,
+Solarized) and hand-picked for the rest. A plain nearest-colour search would
+turn Solarized red into orange and give gruvbox CPU and download the same
+colour; a test checks that the colours that carry meaning (good / warm /
+hot, download / upload, CPU / RAM / network) stay apart in every theme.
+The 16 basic colours, which terminals redefine, are not used. 16-colour
+terminals keep their own palette, so there the themes only differ for
+`mono` and `light`.
 `NO_COLOR`, `TERM=dumb` and `--no-colors` turn colours off altogether.
 
 ### Pause
@@ -508,7 +514,7 @@ are built once when the theme or mode changes.
 make test
 ```
 
-`tests/test.c` contains 957 checks and runs under AddressSanitizer,
+`tests/test.c` contains 958 checks and runs under AddressSanitizer,
 LeakSanitizer and UndefinedBehaviorSanitizer. Each module reads a fixture
 tree of `/proc` and `/sys` files generated in a temporary directory, so
 results do not depend on the host. The suite covers:
